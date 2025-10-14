@@ -16,6 +16,9 @@ import re
 import time
 import io
 import base64
+import json
+import os
+import tempfile
 
 # Dependencias: asume instaladas en el entorno
 import streamlit as st
@@ -26,9 +29,10 @@ from gspread.exceptions import APIError
 from PIL import Image
 
 # ------------------ CONFIG ------------------
-# Ajusta la ruta de tu carpeta de credenciales/Excel si es necesario
+# Ajusta la ruta de tu carpeta de credenciales/Excel si es necesario (local)
 CRED_FOLDER = Path(r"C:\Users\agaribayda\Documents\Streamlit Calificaciones AP25")
 CRED_PREFIX = "credenciales"
+# default EXCEL path (fallback se ajusta más abajo)
 EXCEL_PATH = CRED_FOLDER / "AlineacionesAP25.xlsx"
 
 SHEET_URL = "https://docs.google.com/spreadsheets/d/1OQRTq818EXBeibBmWlrcSZm83do264l2mb5jnBmzsu8"
@@ -52,7 +56,6 @@ LOGO_WIDTH = 240  # ancho en píxeles; sube este valor para una imagen más gran
 try:
     app_dir = Path(__file__).parent
 except Exception:
-    # fallback en caso de ejecución en entornos donde __file__ no está definido
     app_dir = Path.cwd()
 
 logo_path = app_dir / LOGO_FILENAME
@@ -96,17 +99,6 @@ def find_credentials_file(folder: Path, prefix="credenciales"):
             return p
     return None
 
-def connect_gsheets(cred_path: Path, sheet_url: str):
-    try:
-        creds = Credentials.from_service_account_file(str(cred_path), scopes=SCOPES)
-        client = gspread.authorize(creds)
-        sh = client.open_by_url(sheet_url)
-        return sh
-    except Exception as e:
-        st.error("Error autenticando o abriendo la Google Sheet con las credenciales proporcionadas.")
-        st.exception(e)
-        return None
-
 @st.cache_data(ttl=30)
 def load_local_excel(path: Path):
     if not path.exists():
@@ -140,13 +132,115 @@ def get_or_create_ratings_ws(sh, title=RATINGS_SHEET_NAME):
         st.exception(e)
         return None
 
-# ------------------ Inicialización ------------------
-cred_file = find_credentials_file(CRED_FOLDER, CRED_PREFIX)
-if not cred_file:
-    st.error(f"No se encontró un archivo de credenciales que empiece por '{CRED_PREFIX}' en: {CRED_FOLDER}")
-    st.stop()
+def connect_gsheets_flexible(cred_path: Path = None, sheet_url: str = None):
+    """
+    Intenta en este orden:
+     1) leer JSON desde st.secrets['SERVICE_ACCOUNT_JSON'] (o dict en st.secrets['GCP_SERVICE_ACCOUNT'])
+     2) leer base64 en st.secrets['SERVICE_ACCOUNT_BASE64']
+     3) leer archivo cred_path si es proporcionado
+     4) buscar archivo local con prefijo (find_credentials_file en el repo o en CRED_FOLDER)
+    Devuelve el objeto gspread.Spreadsheet o None en caso de error.
+    """
+    creds = None
 
-sh = connect_gsheets(cred_file, SHEET_URL)
+    # 1) JSON directo en secrets
+    try:
+        sa = st.secrets.get("SERVICE_ACCOUNT_JSON", None)
+        if sa:
+            if isinstance(sa, dict):
+                sa_dict = sa
+            else:
+                try:
+                    sa_dict = json.loads(sa)
+                except Exception as e:
+                    # A veces el TOML almacenado con triple-quotes puede contener paréntesis extras,
+                    # o bien el usuario pegó el JSON con saltos; intentar limpiar espacios
+                    sa_str = str(sa).strip()
+                    sa_dict = json.loads(sa_str)
+            creds = Credentials.from_service_account_info(sa_dict, scopes=SCOPES)
+            # No mostramos el contenido por seguridad
+            st.sidebar.info("Credenciales cargadas desde Streamlit Secrets (SERVICE_ACCOUNT_JSON).")
+    except Exception:
+        creds = None
+
+    # 2) Secreto como tabla TOML (GCP_SERVICE_ACCOUNT)
+    if creds is None:
+        try:
+            sa2 = st.secrets.get("GCP_SERVICE_ACCOUNT", None)
+            if sa2:
+                # debe ser un dict con las keys
+                if isinstance(sa2, dict):
+                    creds = Credentials.from_service_account_info(sa2, scopes=SCOPES)
+                    st.sidebar.info("Credenciales cargadas desde Streamlit Secrets (GCP_SERVICE_ACCOUNT).")
+        except Exception:
+            creds = None
+
+    # 3) base64 en secrets
+    if creds is None:
+        try:
+            b64 = st.secrets.get("SERVICE_ACCOUNT_BASE64", None)
+            if b64:
+                decoded = base64.b64decode(b64)
+                sa_dict = json.loads(decoded.decode())
+                creds = Credentials.from_service_account_info(sa_dict, scopes=SCOPES)
+                st.sidebar.info("Credenciales cargadas desde Streamlit Secrets (SERVICE_ACCOUNT_BASE64).")
+        except Exception:
+            creds = None
+
+    # 4) Archivo en repo o ruta pasada
+    if creds is None:
+        # Si la app recibió cred_path explícito y existe
+        try:
+            if cred_path is not None and Path(cred_path).exists():
+                creds = Credentials.from_service_account_file(str(cred_path), scopes=SCOPES)
+                st.sidebar.info(f"Credenciales cargadas desde archivo: {cred_path.name}")
+            else:
+                # intentar encontrar archivo en el repositorio con el prefijo definido
+                possible = find_credentials_file(app_dir, CRED_PREFIX)
+                if possible is None and CRED_FOLDER.exists():
+                    possible = find_credentials_file(CRED_FOLDER, CRED_PREFIX)
+                if possible:
+                    creds = Credentials.from_service_account_file(str(possible), scopes=SCOPES)
+                    st.sidebar.info(f"Credenciales cargadas desde archivo: {possible.name}")
+        except Exception:
+            creds = None
+
+    if creds is None:
+        st.error("No se encontraron credenciales válidas. Asegúrate de haber configurado SERVICE_ACCOUNT_JSON en Secrets o de subir el archivo de credenciales al repo.")
+        return None
+
+    # Autorizar gspread con cred
+    try:
+        client = gspread.authorize(creds)
+        sh = client.open_by_url(sheet_url)
+        return sh
+    except Exception as e:
+        st.error("Error autenticando/abriendo Google Sheets con las credenciales cargadas.")
+        st.exception(e)
+        return None
+
+# ------------------ Inicialización ------------------
+# fallback EXCEL_PATH: si no existe la ruta absoluta (ej. Cloud), busca en el directorio de la app
+if not EXCEL_PATH.exists():
+    EXCEL_PATH = app_dir / "AlineacionesAP25.xlsx"
+
+cred_file = None
+# Intentamos encontrar localmente (útil si subiste el JSON al repo)
+possible_local = find_credentials_file(app_dir, CRED_PREFIX)
+if possible_local:
+    cred_file = possible_local
+else:
+    # si hay CRED_FOLDER y contiene algo
+    if CRED_FOLDER.exists():
+        possible_folder = find_credentials_file(CRED_FOLDER, CRED_PREFIX)
+        if possible_folder:
+            cred_file = possible_folder
+
+if not cred_file and not st.secrets.keys():
+    # Si no hay nada en secrets y no se encontró archivo local -> informar al usuario (pero no detener, dejar que connect informe)
+    st.warning("No se detectó archivo de credenciales en el repo ni claves en Streamlit Secrets. Intenta configurar SERVICE_ACCOUNT_JSON en Settings → Secrets.")
+
+sh = connect_gsheets_flexible(cred_path=cred_file, sheet_url=SHEET_URL)
 if sh is None:
     st.stop()
 
