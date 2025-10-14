@@ -146,6 +146,88 @@ if not cred_file:
     st.error(f"No se encontró un archivo de credenciales que empiece por '{CRED_PREFIX}' en: {CRED_FOLDER}")
     st.stop()
 
+# ---------- Bloque: carga flexible de credenciales (usar con Streamlit Cloud) ----------
+import os
+import json
+import streamlit as st
+from google.oauth2.service_account import Credentials
+import gspread
+from pathlib import Path
+
+# asume que SCOPES, CRED_FOLDER y CRED_PREFIX ya están definidos más arriba en tu archivo
+
+def find_credentials_file(folder: Path, prefix="credenciales"):
+    """Fallback local (no rompe si no existe)."""
+    if not folder.exists():
+        return None
+    for p in folder.iterdir():
+        if p.is_file() and p.name.lower().startswith(prefix.lower()):
+            return p
+    return None
+
+def load_service_account_credentials():
+    """
+    Intenta en este orden:
+      1) st.secrets['gcp_service_account'] (Streamlit Cloud TOML/object)
+      2) st.secrets['GSPREAD_SERVICE_ACCOUNT_JSON'] (Streamlit Cloud) o ENV 'GSPREAD_SERVICE_ACCOUNT_JSON'
+      3) archivo local que empiece por credenciales* (desarrollo)
+    Retorna: google.oauth2.service_account.Credentials o None
+    """
+    # 1) st.secrets con objeto (recomendado)
+    try:
+        if isinstance(st.secrets, dict):
+            if "gcp_service_account" in st.secrets:
+                info = st.secrets["gcp_service_account"]
+                if isinstance(info, str):
+                    info = json.loads(info)
+                return Credentials.from_service_account_info(info, scopes=SCOPES)
+            if "GSPREAD_SERVICE_ACCOUNT_JSON" in st.secrets:
+                info = st.secrets["GSPREAD_SERVICE_ACCOUNT_JSON"]
+                if isinstance(info, str):
+                    info = json.loads(info)
+                return Credentials.from_service_account_info(info, scopes=SCOPES)
+    except Exception:
+        pass
+
+    # 2) Variable de entorno con JSON completo
+    sa_json = os.environ.get("GSPREAD_SERVICE_ACCOUNT_JSON")
+    if sa_json:
+        try:
+            info = json.loads(sa_json)
+            return Credentials.from_service_account_info(info, scopes=SCOPES)
+        except Exception:
+            pass
+
+    # 3) Fallback a archivo local (modo desarrollo)
+    try:
+        cred_file = find_credentials_file(CRED_FOLDER, CRED_PREFIX)
+        if cred_file:
+            return Credentials.from_service_account_file(str(cred_file), scopes=SCOPES)
+    except Exception:
+        pass
+
+    return None
+
+def connect_gsheets(cred_path: Path = None, sheet_url: str = None):
+    """
+    Conecta y devuelve gspread.Spreadsheet o None mostrando mensaje en UI.
+    """
+    try:
+        creds = load_service_account_credentials()
+        if creds is None and cred_path is not None:
+            creds = Credentials.from_service_account_file(str(cred_path), scopes=SCOPES)
+        if creds is None:
+            st.error("No se encontraron credenciales. Añade las credenciales en Streamlit Secrets (recomendado) o configura la variable de entorno GSPREAD_SERVICE_ACCOUNT_JSON.")
+            return None
+        client = gspread.authorize(creds)
+        sh = client.open_by_url(sheet_url)
+        return sh
+    except Exception as e:
+        st.error("Error autenticando o abriendo la Google Sheet con las credenciales proporcionadas.")
+        st.exception(e)
+        return None
+# -----------------------------------------------------------------------
+
 sh = connect_gsheets(cred_file, SHEET_URL)
 if sh is None:
     st.stop()
