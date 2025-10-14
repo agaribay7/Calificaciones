@@ -45,6 +45,39 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive",
 ]
 
+# --- DEBUG TEMPORAL: chequeo seguro de SERVICE_ACCOUNT_JSON (BORRAR después de usar) ---
+try:
+    st.sidebar.markdown("### Debug: SERVICE_ACCOUNT_JSON (temporal)")
+    sa = st.secrets.get("SERVICE_ACCOUNT_JSON", None)
+    if not sa:
+        st.sidebar.error("SERVICE_ACCOUNT_JSON NO está presente en st.secrets.")
+    else:
+        try:
+            # si st.secrets ya devolvió un dict, lo usamos; si devolvió string, intentamos parsearlo
+            sa_dict = sa if isinstance(sa, dict) else json.loads(str(sa).strip())
+            keys = sorted(list(sa_dict.keys()))
+            st.sidebar.success(f"SERVICE_ACCOUNT_JSON parseado OK — keys: {keys}")
+            # mostrar client_email (útil para compartir la hoja). Esto NO expone la private_key.
+            if "client_email" in sa_dict:
+                st.sidebar.info(f"client_email detectado: {sa_dict['client_email']}")
+            else:
+                st.sidebar.warning("client_email NO encontrado en el JSON.")
+            # intentar crear el objeto de credenciales (sin autorizar ni abrir la Sheet)
+            try:
+                creds_obj = Credentials.from_service_account_info(sa_dict, scopes=SCOPES)
+                st.sidebar.success("Credentials.from_service_account_info -> OK")
+                st.sidebar.write("Tipo de credencial creada:", type(creds_obj).__name__)
+            except Exception as e:
+                st.sidebar.error("Falló Credentials.from_service_account_info (ver excepción).")
+                st.sidebar.exception(e)
+        except Exception as e:
+            st.sidebar.error("Fallo al parsear JSON desde SERVICE_ACCOUNT_JSON (json.loads falló).")
+            st.sidebar.exception(e)
+except Exception as e:
+    st.sidebar.error("Error inesperado en debug de secrets.")
+    st.sidebar.exception(e)
+# --- FIN DEBUG ---
+
 st.set_page_config(page_title="Calificar Alineaciones — Google Sheets", layout="wide")
 st.title("Calificar jugadores por jornada")
 
@@ -153,12 +186,9 @@ def connect_gsheets_flexible(cred_path: Path = None, sheet_url: str = None):
                 try:
                     sa_dict = json.loads(sa)
                 except Exception as e:
-                    # A veces el TOML almacenado con triple-quotes puede contener paréntesis extras,
-                    # o bien el usuario pegó el JSON con saltos; intentar limpiar espacios
                     sa_str = str(sa).strip()
                     sa_dict = json.loads(sa_str)
             creds = Credentials.from_service_account_info(sa_dict, scopes=SCOPES)
-            # No mostramos el contenido por seguridad
             st.sidebar.info("Credenciales cargadas desde Streamlit Secrets (SERVICE_ACCOUNT_JSON).")
     except Exception:
         creds = None
@@ -168,7 +198,6 @@ def connect_gsheets_flexible(cred_path: Path = None, sheet_url: str = None):
         try:
             sa2 = st.secrets.get("GCP_SERVICE_ACCOUNT", None)
             if sa2:
-                # debe ser un dict con las keys
                 if isinstance(sa2, dict):
                     creds = Credentials.from_service_account_info(sa2, scopes=SCOPES)
                     st.sidebar.info("Credenciales cargadas desde Streamlit Secrets (GCP_SERVICE_ACCOUNT).")
@@ -189,13 +218,11 @@ def connect_gsheets_flexible(cred_path: Path = None, sheet_url: str = None):
 
     # 4) Archivo en repo o ruta pasada
     if creds is None:
-        # Si la app recibió cred_path explícito y existe
         try:
             if cred_path is not None and Path(cred_path).exists():
                 creds = Credentials.from_service_account_file(str(cred_path), scopes=SCOPES)
                 st.sidebar.info(f"Credenciales cargadas desde archivo: {cred_path.name}")
             else:
-                # intentar encontrar archivo en el repositorio con el prefijo definido
                 possible = find_credentials_file(app_dir, CRED_PREFIX)
                 if possible is None and CRED_FOLDER.exists():
                     possible = find_credentials_file(CRED_FOLDER, CRED_PREFIX)
