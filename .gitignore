@@ -1,0 +1,24 @@
+# Streamlit secrets & credentials
+.streamlit/secrets.toml
+credenciales*.json
+credentials*.json
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtualenvs
+venv/
+env/
+.venv/
+
+# IDEs
+.vscode/
+.idea/
+
+# Misc
+.DS_Store
+*.log
