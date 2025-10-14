@@ -1,0 +1,23 @@
+# Core
+streamlit>=1.18.0,<2.0
+pandas>=1.4.0
+Pillow>=9.0.0
+openpyxl>=3.0.0
+
+# Google / Sheets
+gspread>=5.0.0
+google-auth>=2.0.0
+google-auth-oauthlib>=0.5.0
+google-api-python-client>=2.0.0
+
+# Optional / env & helpers
+python-dotenv>=0.21.0    # si usas .env en local
+pyyaml>=6.0              # útil si parseas YAML / secrets (opcional)
+
+# Dev / tooling (opcional)
+pytest>=7.0.0            # si vas a añadir tests
+black>=23.0.0            # formateo opcional
+isort>=5.0.0             # orden de imports
+
+# (Opcional) Si planeas usar la API de Drive con scopes adicionales:
+# google-drive-api-client is covered by google-api-python-client but puedes añadir extras si los necesitas.
