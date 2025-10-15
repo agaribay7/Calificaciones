@@ -11,6 +11,8 @@ Mejoras añadidas:
  - Al descargar las calificaciones del evaluador, se eliminan las columnas `id` y `timestamp` y
    se formatea `Fecha Partido` para incluir solo la fecha (YYYY-MM-DD) sin hora.
  - Prevenciones contra doble-submit y refuerzo del índice tras appends para evitar duplicados.
+ - CORRECCIÓN: al crear un evaluador nuevo, ahora la ejecución continúa y el evaluador queda seleccionado
+   sin forzar rerun; evita que la app vuelva a la pantalla de creación.
 """
 
 import base64
@@ -490,7 +492,7 @@ st.markdown(
         min-width: {computed_width}px;
         width: {computed_width}px;
     }}
-    /* Fallback selectors used by some Streamlit builds */
+    /* Fallback selectors used por algunas builds de Streamlit */
     .css-1d391kg, .css-1v3fvcr, .css-1lsmgbg {{
         min-width: {computed_width}px !important;
         width: {computed_width}px !important;
@@ -523,7 +525,8 @@ if selected_eval == placeholder_option:
 
 if selected_eval == create_option:
     # Usamos un text_input y botón para crear un nuevo evaluador.
-    # Si se crea, escribimos directamente la clave del selectbox y forzamos rerun
+    # Si se crea, escribimos directamente la clave del selectbox y CONTINUAMOS en esta ejecución
+    # (no forzamos rerun) para evitar que la app vuelva a la pantalla de creación.
     new_eval = st.sidebar.text_input("Nuevo nombre de evaluador", value="", key="new_eval_input")
     create_pressed = st.sidebar.button("Crear y usar este nombre", key="create_eval_btn")
     st.sidebar.info("Escribe un nombre y pulsa 'Crear y usar este nombre' para habilitar la app.")
@@ -534,33 +537,22 @@ if selected_eval == create_option:
         st.sidebar.error("El nombre no puede estar vacío.")
         st.stop()
 
-    # Guardamos en session_state y forzamos que el selectbox cambie a ese valor
+    # Guardamos en session_state y hacemos que el flujo siga usando el nuevo evaluador
     nuevo = new_eval.strip()
     st.session_state["evaluador"] = nuevo
     st.session_state["pending_new_eval"] = nuevo
     st.session_state["first_load"] = False
 
-    # Ajustar el valor del selectbox (su key es 'eval_selectbox'): así el widget mostrará el nuevo valor
+    # Intentamos fijar el widget selectbox en session_state (clave 'eval_selectbox')
     try:
         st.session_state["eval_selectbox"] = nuevo
     except Exception:
-        # en algunos entornos puede fallar si el selectbox aún no está inicializado;
-        # no es crítico, el rerun siguiente lo normalizará.
         logger.exception("No se pudo asignar eval_selectbox en session_state directamente.")
 
+    # IMPORTANTE: en lugar de forzar un rerun, seguimos la ejecución estableciendo selected_eval
+    # para que el resto del flujo lo trate como la opción seleccionada.
+    selected_eval = nuevo
     st.sidebar.success(f"Creado evaluador: {nuevo}")
-
-    # Forzar rerun seguro mediante query params para que el selectbox se reevalúe con el nuevo valor.
-    try:
-        params = dict(st.query_params)
-        params['_ts'] = [str(time.time())]
-        st.query_params = params
-    except Exception:
-        logger.exception("No se pudo forzar rerun vía query params tras crear evaluador; intentando st.experimental_rerun() fallback")
-        try:
-            st.experimental_rerun()
-        except Exception:
-            logger.exception("st.experimental_rerun() lanzó excepción en fallback (se ignora).")
 
 if selected_eval != create_option and selected_eval != placeholder_option:
     st.session_state["evaluador"] = selected_eval
