@@ -1,245 +1,519 @@
 # app.py
 """
 Streamlit app — Calificar Alineaciones — Google Sheets
-Versión: lee alineaciones desde la Google Sheet (worksheet "Alineaciones").
-Mantiene la pestaña "Calificaciones" para leer/guardar las calificaciones.
-Credenciales: desde st.secrets (gcp_service_account o SERVICE_ACCOUNT_JSON) o
-GOOGLE_APPLICATION_CREDENTIALS / fichero local como fallback (solo para dev).
+Versión: ajuste automático del ancho de la barra lateral para que el selector
+de evaluador quepa por defecto (sin que el usuario tenga que redimensionar).
+Mejoras añadidas:
+ - Normalización de strings antes de crear el `id` (evita duplicados por tildes/espacios/mayúsculas).
+ - Lectura mínima de la hoja de `Calificaciones` (solo columnas A:K) para construir mapas id->rownum/timestamp,
+   evitando cargar todo el sheet cuando no es necesario.
+ - Para comparación de filas existentes se leen filas individuales (`row_values`) en lugar de `get_all_records()` completo.
+ - Al descargar las calificaciones del evaluador, se eliminan las columnas `id` y `timestamp` y
+   se formatea `Fecha Partido` para incluir solo la fecha (YYYY-MM-DD) sin hora.
+ - Prevenciones contra doble-submit y refuerzo del índice tras appends para evitar duplicados.
 """
 
-import json
-import os
-import io
 import base64
+import hashlib
+import io
+import json
+import logging
+import os
+import random
 import re
 import time
+import unicodedata
+from datetime import datetime, timezone
 from pathlib import Path
-from datetime import datetime
+from typing import Dict, List
 
-import streamlit as st
 import pandas as pd
+import streamlit as st
 import gspread
 from google.oauth2.service_account import Credentials
 from gspread.exceptions import APIError
-from PIL import Image
 
-# ------------------ CONFIG ------------------
-# Fallback local (solo desarrollo). En Cloud no debe usarse.
-CRED_FOLDER = Path(r"C:\Users\agaribayda\Documents\Streamlit Calificaciones AP25")
-CRED_PREFIX = "credenciales"
+# -------- CONFIG LOGGER --------
+st.set_page_config(page_title="Calificar Alineaciones — Google Sheets", layout="wide")
+logger = logging.getLogger("calificaciones_app")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    ch = logging.StreamHandler()
+    ch.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+    logger.addHandler(ch)
 
+# -------- CONSTANTS / CONFIG --------
 SHEET_URL = "https://docs.google.com/spreadsheets/d/1OQRTq818EXBeibBmWlrcSZm83do264l2mb5jnBmzsu8"
-ALIGN_WORKSHEET_NAME = "Alineaciones"   # <-- tu nombre de hoja para alineaciones
+ALIGN_WORKSHEET_NAME = "Alineaciones"
 RATINGS_SHEET_NAME = "Calificaciones"
 
-SCOPES = [
-    "https://spreadsheets.google.com/feeds",
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive.file",
-    "https://www.googleapis.com/auth/drive",
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+
+COLUMN_MAP = {
+    "Minutos Jugados": "minutos",
+    "Minutos": "minutos",
+    "Jugador": "jugador",
+    "Nombre": "jugador",
+    "Player": "jugador",
+    "Fecha Partido": "fecha_partido",
+    "Fecha": "fecha_partido",
+    "Gol": "gol",
+    "Asistencia": "asistencia",
+    "Resultado Partido": "resultado_partido",
+    "Resultado": "resultado_partido",
+    "Jornada": "jornada",
+}
+
+EXPECTED_RATINGS_HEADERS = [
+    "id",
+    "Jornada",
+    "Jugador",
+    "Evaluador",
+    "Calificacion",
+    "Minutos",
+    "Gol",
+    "Asistencia",
+    "Resultado",
+    "Fecha Partido",
+    "timestamp",
 ]
 
-st.set_page_config(page_title="Calificar Alineaciones — Google Sheets", layout="wide")
-st.title("Calificar jugadores por jornada")
+# -------- Helpers --------
+def safe_key(s: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9_\-]", "_", str(s or ""))
 
-# ------------------ Sidebar: logo (centrado) ------------------
-LOGO_FILENAME = "logo_transparent.png"
-LOGO_WIDTH = 240
 
-try:
-    app_dir = Path(__file__).parent
-except Exception:
-    app_dir = Path.cwd()
+def normalize_str(s: str) -> str:
+    """Normaliza texto para evitar diferencias por mayúsculas, tildes y espacios extras."""
+    if s is None:
+        return ""
+    s2 = str(s).strip().lower()
+    s2 = unicodedata.normalize("NFKD", s2)
+    s2 = "".join(ch for ch in s2 if not unicodedata.combining(ch))
+    s2 = re.sub(r"\s+", " ", s2)
+    return s2
 
-logo_path = app_dir / LOGO_FILENAME
-if logo_path.exists():
+
+def make_row_id(jornada: str, jugador: str, evaluador: str) -> str:
+    base = f"{normalize_str(jornada)}|{normalize_str(jugador)}|{normalize_str(evaluador)}"
+    return hashlib.sha1(base.encode("utf-8")).hexdigest()
+
+
+def now_utc_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def safe_get(d: dict, k: str, default=None):
+    v = d.get(k, default)
+    if isinstance(v, str):
+        return v.strip()
+    return v
+
+
+# Retry wrapper (con backoff y jitter)
+def retry_with_backoff(func, max_retries=5, base=1.0, max_backoff=16.0, *args, **kwargs):
+    attempt = 0
+    last_exc = None
+    while attempt < max_retries:
+        try:
+            return func(*args, **kwargs)
+        except APIError as e:
+            attempt += 1
+            wait = min(max_backoff, base * (2 ** (attempt - 1)))
+            jitter = random.uniform(0, wait * 0.25)
+            logger.warning(f"APIError (intento {attempt}/{max_retries}): {e}. Esperando {wait + jitter:.1f}s antes de reintentar.")
+            time.sleep(wait + jitter)
+            last_exc = e
+        except Exception as e:
+            logger.exception("Error no recuperable en operación gspread")
+            raise
+    raise last_exc
+
+
+def safe_get_all_records(ws):
     try:
-        logo_img = Image.open(logo_path).convert("RGBA")
-        w, h = logo_img.size
-        if w > 0:
-            new_w = LOGO_WIDTH
-            new_h = int(h * new_w / w)
-            logo_img = logo_img.resize((new_w, new_h), Image.LANCZOS)
-        buffered = io.BytesIO()
-        logo_img.save(buffered, format="PNG")
-        img_b64 = base64.b64encode(buffered.getvalue()).decode()
-        html = f"""
-        <div style="display:flex;justify-content:center;align-items:center;padding:8px 0 4px 0;">
-            <img src="data:image/png;base64,{img_b64}" width="{new_w}" style="display:block;">
-        </div>
-        """
-        st.sidebar.markdown(html, unsafe_allow_html=True)
-    except Exception as e:
-        st.sidebar.warning("No se pudo cargar el logo de la sidebar.")
-        st.sidebar.exception(e)
-
-st.sidebar.header("Configuración")
-
-# ------------------ Helpers credenciales / gspread ------------------
-def find_credentials_file(folder: Path, prefix="credenciales"):
-    try:
-        if not folder.exists():
-            return None
-        for p in folder.iterdir():
-            if p.is_file() and p.name.lower().startswith(prefix.lower()):
-                return p
+        return retry_with_backoff(lambda: ws.get_all_records())
     except Exception:
-        return None
-    return None
+        logger.exception("Fallo seguro al leer get_all_records()")
+        return []
 
+
+# Credenciales & gspread (cacheado cliente)
 def get_credentials_from_st_secrets_or_env(scopes):
-    """
-    Order:
-      1) st.secrets["SERVICE_ACCOUNT_JSON"]  (string JSON or dict)
-      2) st.secrets["gcp_service_account"]   (map/dict)
-      3) GOOGLE_APPLICATION_CREDENTIALS env var (path)
-      4) local credential file (CRED_FOLDER)  <- only for dev
-    """
-    # 1) SERVICE_ACCOUNT_JSON
     try:
         if "SERVICE_ACCOUNT_JSON" in st.secrets:
             sa_raw = st.secrets["SERVICE_ACCOUNT_JSON"]
             if isinstance(sa_raw, dict):
                 sa_info = sa_raw
             else:
-                # si es string, parsear
                 sa_info = json.loads(sa_raw)
             return Credentials.from_service_account_info(sa_info, scopes=scopes)
-    except Exception as e:
-        st.warning("SERVICE_ACCOUNT_JSON presente pero no parseable: " + str(e))
+    except Exception:
+        logger.exception("SERVICE_ACCOUNT_JSON presente pero no parseable")
 
-    # 2) gcp_service_account (bloque)
     try:
         if "gcp_service_account" in st.secrets:
             sa_info = st.secrets["gcp_service_account"]
             return Credentials.from_service_account_info(sa_info, scopes=scopes)
-    except Exception as e:
-        st.warning("gcp_service_account presente pero no válido: " + str(e))
+    except Exception:
+        logger.exception("gcp_service_account presente pero no válido")
 
-    # 3) GOOGLE_APPLICATION_CREDENTIALS
-    try:
-        gpath = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
-        if gpath:
-            return Credentials.from_service_account_file(gpath, scopes=scopes)
-    except Exception as e:
-        st.warning("Error cargando GOOGLE_APPLICATION_CREDENTIALS: " + str(e))
-
-    # 4) fallback local file (desarrollo)
-    local = find_credentials_file(CRED_FOLDER, CRED_PREFIX)
-    if local:
+    gpath = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+    if gpath:
         try:
-            return Credentials.from_service_account_file(str(local), scopes=scopes)
-        except Exception as e:
-            st.warning("Error leyendo fichero local de credenciales: " + str(e))
+            return Credentials.from_service_account_file(gpath, scopes=scopes)
+        except Exception:
+            logger.exception("Error cargando GOOGLE_APPLICATION_CREDENTIALS")
 
     return None
 
+
+@st.cache_resource(hash_funcs={Credentials: lambda _: None})
+def get_gspread_client_cached(creds):
+    if creds is None:
+        return None
+    return gspread.authorize(creds)
+
+
 def connect_gsheets(creds, sheet_url):
     if creds is None:
-        st.error("No se han encontrado credenciales para Google Sheets.")
         return None
     try:
-        client = gspread.authorize(creds)
+        client = get_gspread_client_cached(creds)
+        if client is None:
+            return None
         sh = client.open_by_url(sheet_url)
         return sh
-    except Exception as e:
-        st.error("Error autenticando/abriendo la Google Sheet con las credenciales proporcionadas.")
-        st.exception(e)
+    except Exception:
+        logger.exception("Error autenticando/abriendo la Google Sheet")
         return None
+
 
 def get_or_create_ratings_ws(sh, title=RATINGS_SHEET_NAME):
     try:
         try:
             ws = sh.worksheet(title)
-            return ws
-        except gspread.WorksheetNotFound:
+        except Exception:
             ws = sh.add_worksheet(title=title, rows="2000", cols="20")
-            headers = [
-                'Jornada','Jugador','Evaluador','Calificacion','Minutos',
-                'Gol','Asistencia','Resultado','Fecha Partido','timestamp'
-            ]
-            ws.append_row(headers)
-            return ws
-    except Exception as e:
-        st.error("Error obteniendo/creando la pestaña de Calificaciones en Google Sheets.")
-        st.exception(e)
+        headers = ws.row_values(1)
+        if not headers or len(headers) < len(EXPECTED_RATINGS_HEADERS) or (headers and headers[0].strip().lower() != "id"):
+            ws.update("A1", [EXPECTED_RATINGS_HEADERS])
+        return ws
+    except Exception:
+        logger.exception("Error obteniendo/creando la pestaña de Calificaciones")
         return None
 
-# ------------------ Conexión usando st.secrets / fallback ------------------
+
+# ---------------- Simple in-memory cache (session_state) con TTL ----------------
+def _session_cache_get(key: str):
+    entry = st.session_state.get("_cache_internal", {}).get(key)
+    if not entry:
+        return None
+    value, ts, ttl = entry.get("value"), entry.get("ts"), entry.get("ttl")
+    if (time.time() - ts) > ttl:
+        st.session_state["_cache_internal"].pop(key, None)
+        return None
+    return value
+
+
+def _session_cache_set(key: str, value, ttl: int = 30):
+    if "_cache_internal" not in st.session_state:
+        st.session_state["_cache_internal"] = {}
+    st.session_state["_cache_internal"][key] = {"value": value, "ts": time.time(), "ttl": ttl}
+
+
+def _session_cache_invalidate(key_prefix: str):
+    if "_cache_internal" not in st.session_state:
+        return
+    for k in list(st.session_state["_cache_internal"].keys()):
+        if k.startswith(key_prefix):
+            st.session_state["_cache_internal"].pop(k, None)
+
+
+# ---------------- Reads (usando cache ligera) ----------------
+def load_alignments_cached(sh, worksheet_name=ALIGN_WORKSHEET_NAME, ttl_seconds=30) -> pd.DataFrame:
+    cache_key = f"alignments::{worksheet_name}::{SHEET_URL}"
+    cached = _session_cache_get(cache_key)
+    if cached is not None:
+        return cached
+    df = load_alignments_uncached(sh, worksheet_name)
+    _session_cache_set(cache_key, df, ttl=ttl_seconds)
+    return df
+
+
+def load_ratings_cached(ws, ttl_seconds=15) -> pd.DataFrame:
+    cache_key = f"ratings::{ws.id if hasattr(ws,'id') else 'unknown'}::{SHEET_URL}"
+    cached = _session_cache_get(cache_key)
+    if cached is not None:
+        return cached
+    df = load_ratings_uncached(ws)
+    _session_cache_set(cache_key, df, ttl=ttl_seconds)
+    return df
+
+
+def load_alignments_uncached(sh, worksheet_name=ALIGN_WORKSHEET_NAME) -> pd.DataFrame:
+    try:
+        try:
+            ws_align = sh.worksheet(worksheet_name)
+        except Exception:
+            ws_align = sh.sheet1
+        records = safe_get_all_records(ws_align)
+        df = pd.DataFrame(records)
+        if df.empty:
+            return df
+        rename_map = {}
+        for col in df.columns:
+            if col in COLUMN_MAP:
+                rename_map[col] = COLUMN_MAP[col]
+            else:
+                low = str(col).strip().lower()
+                for k, v in COLUMN_MAP.items():
+                    if k.lower() == low:
+                        rename_map[col] = v
+                        break
+        if rename_map:
+            df = df.rename(columns=rename_map)
+        if "fecha_partido" in df.columns:
+            df["fecha_partido"] = pd.to_datetime(df["fecha_partido"], errors="coerce")
+        for ncol in ["minutos", "gol", "asistencia"]:
+            if ncol in df.columns:
+                df[ncol] = pd.to_numeric(df[ncol], errors="coerce").fillna(0).astype(int)
+        return df
+    except Exception:
+        logger.exception("Error cargando la hoja de alineaciones (uncached)")
+        return pd.DataFrame()
+
+
+def load_ratings_uncached(ws) -> pd.DataFrame:
+    try:
+        records = safe_get_all_records(ws)
+        if not records:
+            return pd.DataFrame(columns=EXPECTED_RATINGS_HEADERS)
+        df = pd.DataFrame(records)
+        for col in ["id", "Jornada", "Jugador", "Evaluador", "Calificacion", "timestamp"]:
+            if col not in df.columns:
+                df[col] = None
+        return df
+    except Exception:
+        logger.exception("Error leyendo calificaciones (uncached)")
+        return pd.DataFrame()
+
+
+# -------- Write helpers (batch update / append, condicional) --------
+def append_rows(ws, rows):
+    if not rows:
+        return
+    retry_with_backoff(lambda: ws.append_rows(rows, value_input_option="USER_ENTERED"))
+
+
+def batch_update_rows(spreadsheet, updates: List[Dict]):
+    if not updates:
+        return
+    body = {"valueInputOption": "USER_ENTERED", "data": updates}
+    retry_with_backoff(lambda: spreadsheet.batch_update(body))
+
+
+def normalize_and_validate_record(r: dict) -> dict:
+    out = dict(r)
+    try:
+        cal = out.get("Calificacion", "")
+        if cal is None or cal == "":
+            out["Calificacion"] = ""
+        else:
+            c = float(cal)
+            if c < 0:
+                c = 0.0
+            if c > 10:
+                c = 10.0
+            out["Calificacion"] = float(round(c * 2) / 2)
+    except Exception:
+        out["Calificacion"] = ""
+    try:
+        m = out.get("Minutos", "")
+        if pd.isna(m) or m in (None, ""):
+            out["Minutos"] = ""
+        else:
+            out["Minutos"] = int(m)
+    except Exception:
+        out["Minutos"] = ""
+    try:
+        out["Gol"] = int(out.get("Gol", 0) or 0)
+    except Exception:
+        out["Gol"] = 0
+    try:
+        out["Asistencia"] = int(out.get("Asistencia", 0) or 0)
+    except Exception:
+        out["Asistencia"] = 0
+    return out
+
+
+# -------- Optimized helpers para index/ts (lectura mínima) --------
+
+def read_ratings_index(ws):
+    """Intenta leer solo el rango A2:K (id..timestamp) y construir mapas id->rownum y id->timestamp.
+    Si falla, hace fallback a get_all_records().
+    Devuelve (id_to_rownum, id_to_timestamp).
+    """
+    try:
+        rows = retry_with_backoff(lambda: ws.get("A2:K"))
+        id_to_rownum = {}
+        id_to_ts = {}
+        for i, row in enumerate(rows, start=2):
+            rid = str(row[0]).strip() if len(row) > 0 else ""
+            ts = str(row[10]).strip() if len(row) > 10 else ""
+            if rid:
+                id_to_rownum[rid] = i
+                id_to_ts[rid] = ts
+        return id_to_rownum, id_to_ts
+    except Exception:
+        logger.exception("No se pudo leer A2:K; fallback a get_all_records() para indexar ids")
+        records = safe_get_all_records(ws)
+        id_to_rownum = {}
+        id_to_ts = {}
+        for idx, r in enumerate(records, start=2):
+            rid = str(r.get("id", "")).strip()
+            ts = str(r.get("timestamp", "") or "")
+            if rid:
+                id_to_rownum[rid] = idx
+                id_to_ts[rid] = ts
+        return id_to_rownum, id_to_ts
+
+
+# -------- App UI / Logic --------
+st.title("Calificar jugadores por jornada")
+
+# Sidebar: logo opcional (queda en la sidebar)
+LOGO_FILENAME = "logo_transparent.png"
+try:
+    app_dir = Path(__file__).parent
+except Exception:
+    app_dir = Path.cwd()
+logo_path = app_dir / LOGO_FILENAME
+if logo_path.exists():
+    try:
+        from PIL import Image
+
+        logo_img = Image.open(logo_path).convert("RGBA")
+        w, h = logo_img.size
+        new_w = 240
+        new_h = int(h * new_w / w)
+        logo_img = logo_img.resize((new_w, new_h), Image.LANCZOS)
+        buffered = io.BytesIO()
+        logo_img.save(buffered, format="PNG")
+        img_b64 = base64.b64encode(buffered.getvalue()).decode()
+        st.sidebar.markdown(
+            f"""<div style="display:flex;justify-content:center;align-items:center;padding:8px 0 4px 0;">
+            <img src="data:image/png;base64,{img_b64}" width="{new_w}" style="display:block;">
+        </div>""",
+            unsafe_allow_html=True,
+        )
+    except Exception:
+        logger.exception("No se pudo cargar logo")
+
+st.sidebar.header("Configuración")
+
+# Credenciales y conexión
 creds = get_credentials_from_st_secrets_or_env(SCOPES)
 if creds is None:
-    st.error("No se encontraron credenciales válidas. Añade `gcp_service_account` o `SERVICE_ACCOUNT_JSON` en Streamlit Secrets.")
+    st.sidebar.error("No se encontraron credenciales válidas. Añade `gcp_service_account` o `SERVICE_ACCOUNT_JSON` en Streamlit Secrets o define GOOGLE_APPLICATION_CREDENTIALS.")
     st.stop()
 
 sh = connect_gsheets(creds, SHEET_URL)
 if sh is None:
+    st.error("No se pudo conectar con la Google Sheet. Revisa las credenciales/URL.")
     st.stop()
 
 ratings_ws = get_or_create_ratings_ws(sh)
 if ratings_ws is None:
+    st.error("No se pudo obtener o crear la pestaña de Calificaciones.")
     st.stop()
 
-# ------------------ Cargar alineaciones desde la worksheet "Alineaciones" ------------------
-try:
-    try:
-        ws_align = sh.worksheet(ALIGN_WORKSHEET_NAME)
-    except Exception:
-        # si no existe la worksheet con ese nombre, usar la primera hoja
-        ws_align = sh.sheet1
-
-    align_records = ws_align.get_all_records()
-    df = pd.DataFrame(align_records)
-    # normalizar columnas y Fecha Partido como en tu código original
-    df = df.rename(columns={col: col.strip() if isinstance(col, str) else col for col in df.columns})
-    for candidate in ['Fecha Partido','Fecha','FechaPartido','fecha_partido']:
-        if candidate in df.columns:
-            df['Fecha Partido'] = pd.to_datetime(df[candidate], errors='coerce')
-            break
-
-    if df is None or df.empty:
-        st.error(f"La hoja '{ALIGN_WORKSHEET_NAME}' está vacía o no tiene registros legibles.")
-        st.stop()
-
-except Exception as e:
-    st.error("Error cargando la hoja de alineaciones desde Google Sheets.")
-    st.exception(e)
+# Cargar datos (usando cache ligero)
+df_align = load_alignments_cached(sh, ALIGN_WORKSHEET_NAME)
+if df_align is None or df_align.empty:
+    st.error(f"La hoja '{ALIGN_WORKSHEET_NAME}' está vacía o no tiene registros legibles.")
     st.stop()
 
-# ------------------ Leer registros existentes desde la pestaña Calificaciones ------------------
-records = []
-try:
-    records = ratings_ws.get_all_records()
-except Exception as e:
-    st.warning("No se pudieron leer las calificaciones existentes (continuamos, pero la lista de evaluadores puede estar vacía).")
-    st.exception(e)
-    records = []
+# Cargamos las calificaciones en memoria (para UI, promedio y creación de evaluadores)
+ratings_df = load_ratings_cached(ratings_ws)
 
-# ------------------ Session state defaults ------------------
-if 'first_load' not in st.session_state:
-    st.session_state['first_load'] = True
-if 'evaluador' not in st.session_state:
-    st.session_state['evaluador'] = ""
-if 'pending_new_eval' not in st.session_state:
-    st.session_state['pending_new_eval'] = ""
+# Session state defaults
+st.session_state.setdefault("first_load", True)
+st.session_state.setdefault("evaluador", "")
+st.session_state.setdefault("pending_new_eval", "")
+st.session_state.setdefault("submitted_jornada", None)
+st.session_state.setdefault("saving_in_progress", False)  # evita envíos concurrentes
 
-# ------------------ Sidebar: evaluador (misma lógica que tenías) ------------------
-existing_evaluadores = sorted({str(r.get('Evaluador','')).strip() for r in records if str(r.get('Evaluador','')).strip()})
+# Sidebar: evaluador list / create UI (selector en sidebar)
+existing_evaluadores = sorted({str(r).strip() for r in ratings_df["Evaluador"].dropna().unique()}) if not ratings_df.empty else []
 create_option = "— Crear nuevo evaluador —"
 placeholder_option = "— Selecciona evaluador —"
 
 temp_extra = []
-if st.session_state.get('pending_new_eval'):
-    pending = st.session_state['pending_new_eval'].strip()
+if st.session_state.get("pending_new_eval"):
+    pending = st.session_state["pending_new_eval"].strip()
     if pending and pending not in existing_evaluadores:
         temp_extra = [pending]
-    st.session_state['pending_new_eval'] = ""
+    st.session_state["pending_new_eval"] = ""
 
-default_value = placeholder_option if st.session_state.get('first_load', False) else (st.session_state.get('evaluador') or placeholder_option)
+# Respectamos un posible valor previamente forzado del selectbox
+default_value = st.session_state.get("eval_selectbox", None)
+if default_value is None:
+    default_value = placeholder_option if st.session_state.get("first_load", False) else (st.session_state.get("evaluador") or placeholder_option)
 eval_options = [placeholder_option] + existing_evaluadores + temp_extra + [create_option]
 default_index = 0
 if default_value in eval_options:
     default_index = eval_options.index(default_value)
 
+# --------------------------
+# Aquí inyectamos CSS dinámico según el contenido de eval_options
+# --------------------------
+max_label_len = 0
+try:
+    max_label_len = max(len(str(o)) for o in eval_options) if eval_options else 30
+except Exception:
+    max_label_len = 30
+
+CHAR_WIDTH_PX = 8
+HORIZONTAL_PADDING_PX = 120  # espacio adicional para padding / iconos / scrollbar
+MIN_SIDEBAR_PX = 300
+MAX_SIDEBAR_PX = 900
+
+computed_width = max(MIN_SIDEBAR_PX, min(MAX_SIDEBAR_PX, max_label_len * CHAR_WIDTH_PX + HORIZONTAL_PADDING_PX))
+listbox_min_width = max(280, computed_width - 40)
+
+st.markdown(
+    f"""
+    <style>
+    /* Target common sidebar container */
+    [data-testid="stSidebar"] > div:first-child {{
+        min-width: {computed_width}px;
+        width: {computed_width}px;
+    }}
+    /* Fallback selectors used by some Streamlit builds */
+    .css-1d391kg, .css-1v3fvcr, .css-1lsmgbg {{
+        min-width: {computed_width}px !important;
+        width: {computed_width}px !important;
+    }}
+    /* Expand the listbox (dropdown options panel) */
+    div[role="listbox"] {{
+        min-width: {listbox_min_width}px !important;
+        width: {listbox_min_width}px !important;
+    }}
+    /* Allow selectbox label / content to wrap instead of truncating */
+    .stSelectbox div[role="button"], .stSelectbox .css-1tq9d2s {{
+        white-space: normal !important;
+    }}
+    /* Ensure sidebar widgets don't overflow horizontally */
+    [data-testid="stSidebar"] .stSelectbox, [data-testid="stSidebar"] .stTextInput {{
+        width: 100% !important;
+    }}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+# -- Selector en la barra lateral (debería caber por defecto ahora) --
 selected_eval = st.sidebar.selectbox("Elige tu evaluador", eval_options, index=default_index, key="eval_selectbox")
 
 if selected_eval == placeholder_option:
@@ -248,460 +522,488 @@ if selected_eval == placeholder_option:
     st.stop()
 
 if selected_eval == create_option:
+    # Usamos un text_input y botón para crear un nuevo evaluador.
+    # Si se crea, escribimos directamente la clave del selectbox y forzamos rerun
     new_eval = st.sidebar.text_input("Nuevo nombre de evaluador", value="", key="new_eval_input")
     create_pressed = st.sidebar.button("Crear y usar este nombre", key="create_eval_btn")
     st.sidebar.info("Escribe un nombre y pulsa 'Crear y usar este nombre' para habilitar la app.")
     if not create_pressed:
         st.warning("La app está inactiva hasta que confirmes la creación del evaluador.")
         st.stop()
-    if create_pressed:
-        if new_eval.strip() == "":
-            st.sidebar.error("El nombre no puede estar vacío.")
-            st.stop()
-        st.session_state['evaluador'] = new_eval.strip()
-        st.session_state['pending_new_eval'] = new_eval.strip()
-        st.session_state['first_load'] = False
-        st.sidebar.success(f"Creado evaluador: {st.session_state['evaluador']}")
+    if new_eval.strip() == "":
+        st.sidebar.error("El nombre no puede estar vacío.")
+        st.stop()
+
+    # Guardamos en session_state y forzamos que el selectbox cambie a ese valor
+    nuevo = new_eval.strip()
+    st.session_state["evaluador"] = nuevo
+    st.session_state["pending_new_eval"] = nuevo
+    st.session_state["first_load"] = False
+
+    # Ajustar el valor del selectbox (su key es 'eval_selectbox'): así el widget mostrará el nuevo valor
+    try:
+        st.session_state["eval_selectbox"] = nuevo
+    except Exception:
+        # en algunos entornos puede fallar si el selectbox aún no está inicializado;
+        # no es crítico, el rerun siguiente lo normalizará.
+        logger.exception("No se pudo asignar eval_selectbox en session_state directamente.")
+
+    st.sidebar.success(f"Creado evaluador: {nuevo}")
+
+    # Forzar rerun seguro mediante query params para que el selectbox se reevalúe con el nuevo valor.
+    try:
+        params = dict(st.query_params)
+        params['_ts'] = [str(time.time())]
+        st.query_params = params
+    except Exception:
+        logger.exception("No se pudo forzar rerun vía query params tras crear evaluador; intentando st.experimental_rerun() fallback")
+        try:
+            st.experimental_rerun()
+        except Exception:
+            logger.exception("st.experimental_rerun() lanzó excepción en fallback (se ignora).")
 
 if selected_eval != create_option and selected_eval != placeholder_option:
-    st.session_state['evaluador'] = selected_eval
-    st.session_state['first_load'] = False
+    st.session_state["evaluador"] = selected_eval
+    st.session_state["first_load"] = False
 
-evaluador = st.session_state.get('evaluador', '')
+evaluador = st.session_state.get("evaluador", "")
 if not evaluador:
-    st.warning("Evaluador no establecido. Selecciona o crea un evaluador en la barra lateral.")
+    st.sidebar.warning("Evaluador no establecido.")
     st.stop()
 
-# Badge persistente
 st.sidebar.markdown("---")
 st.sidebar.markdown(f"**Evaluando:**  \n`{evaluador}`")
 st.sidebar.markdown("")
 
-# ------------------ Selección de jornada y resto de UI (igual que tu código original) ------------------
-if 'Jornada' not in df.columns:
-    st.error('La columna "Jornada" no está presente en la hoja de alineaciones. Actualiza la sheet.')
+# ---------------- Validación de esquema de alignments ----------------
+missing_cols = []
+for exp in ["jornada", "jugador"]:
+    if exp not in df_align.columns:
+        missing_cols.append(exp)
+if missing_cols:
+    st.error(f"Columnas esperadas faltantes en '{ALIGN_WORKSHEET_NAME}': {missing_cols}. Revisa la sheet.")
     st.stop()
 
-try:
-    unique_jornadas = list(pd.unique(df['Jornada'].dropna().values))
+# ---------------- Selección jornada y etiqueta ----------------
+def make_jornada_label(df, j):
+    subset = df[df["jornada"] == j]
+    found_team_values = []
+    resultado_partido = None
 
-    def make_jornada_label(j):
-        subset = df[df['Jornada'] == j]
-        found_team_values = []
-        resultado_partido = None
+    if "resultado_partido" in subset.columns:
+        nonnull = subset["resultado_partido"].dropna()
+        if not nonnull.empty:
+            rp = str(nonnull.iloc[0]).strip()
+            if rp:
+                score_pat = re.compile(r"(\d+\s*[-–]\s*\d+)")
+                m2 = score_pat.search(rp)
+                if m2:
+                    resultado_partido = m2.group(1).replace("\u2013", "-").strip()
 
-        if 'Resultado Partido' in subset.columns:
-            nonnull = subset['Resultado Partido'].dropna()
-            if not nonnull.empty:
-                rp = str(nonnull.iloc[0]).strip()
-                if rp:
-                    pattern_score = re.compile(r'^\s*([^\d\n]+?)\s+(\d+\s*[-–]\s*\d+)\s+([^\d\n]+)\s*$', flags=re.IGNORECASE)
-                    m = pattern_score.match(rp)
-                    if m:
-                        t1 = m.group(1).strip()
-                        res = m.group(2).strip().replace('\u2013', '-')
-                        t2 = m.group(3).strip()
-                        if t1 and t2:
-                            found_team_values = [t1, t2]
+    for col in subset.columns:
+        low = str(col).lower()
+        if any(k in low for k in ["local", "visit", "equipo", "home", "away", "opponent", "club", "oponente", "team"]):
+            vals = subset[col].dropna().unique().tolist()
+            for v in vals:
+                if v not in (None, "", pd.NA) and str(v).strip() not in found_team_values:
+                    found_team_values.append(str(v).strip())
+            if found_team_values:
+                break
+
+    if not found_team_values:
+        pattern_vs = re.compile(r"\b(.+?)\s+vs\.?\s+(.+)", flags=re.IGNORECASE)
+        pattern_score = re.compile(r"\s*([^\d\n]+?)\s+(\d+\s*[-–]\s*\d+)\s+([^\d\n]+)\s*", flags=re.IGNORECASE)
+        for col in subset.columns:
+            for cell in subset[col].dropna().astype(str).unique():
+                cell_str = cell.strip()
+                if not cell_str:
+                    continue
+                m_vs = pattern_vs.search(cell_str)
+                if m_vs:
+                    t1 = m_vs.group(1).strip()
+                    t2 = m_vs.group(2).strip()
+                    if t1 and t2:
+                        found_team_values = [t1, t2]
+                        break
+                m_sc = pattern_score.search(cell_str)
+                if m_sc:
+                    t1 = m_sc.group(1).strip()
+                    res = m_sc.group(2).strip().replace("\u2013", "-")
+                    t2 = m_sc.group(3).strip()
+                    if t1 and t2:
+                        found_team_values = [t1, t2]
+                        if not resultado_partido:
                             resultado_partido = res
-                    else:
-                        score_pat = re.compile(r'(\d+\s*[-–]\s*\d+)')
-                        m2 = score_pat.search(rp)
-                        if m2:
-                            resultado_partido = m2.group(1).replace('\u2013', '-').strip()
-
-        if not found_team_values:
-            for col in subset.columns:
-                low = str(col).lower()
-                if any(k.lower() in low for k in ['local','visit','equipo','home','away','rival','opponent','club','oponente','team']):
-                    vals = subset[col].dropna().unique().tolist()
-                    for v in vals:
-                        if v not in (None, "", pd.NA) and str(v).strip() not in found_team_values:
-                            found_team_values.append(str(v).strip())
-                    if found_team_values:
                         break
+            if found_team_values:
+                break
 
-        if not found_team_values:
-            pattern_vs = re.compile(r'\b(.+?)\s+vs\.?\s+(.+)', flags=re.IGNORECASE)
-            pattern_score = re.compile(r'\s*([^\d\n]+?)\s+(\d+\s*[-–]\s*\d+)\s+([^\d\n]+)\s*', flags=re.IGNORECASE)
-            for col in subset.columns:
-                for cell in subset[col].dropna().astype(str).unique():
-                    cell_str = cell.strip()
-                    if not cell_str:
-                        continue
-                    m_vs = pattern_vs.search(cell_str)
-                    if m_vs:
-                        t1 = m_vs.group(1).strip()
-                        t2 = m_vs.group(2).strip()
-                        if t1 and t2:
-                            found_team_values = [t1, t2]
-                            break
-                    m_sc = pattern_score.search(cell_str)
-                    if m_sc:
-                        t1 = m_sc.group(1).strip()
-                        res = m_sc.group(2).strip().replace('\u2013', '-')
-                        t2 = m_sc.group(3).strip()
-                        if t1 and t2:
-                            found_team_values = [t1, t2]
-                            if not resultado_partido:
-                                resultado_partido = res
-                            break
-                if found_team_values:
-                    break
-
-        if not resultado_partido:
-            score_pat = re.compile(r'(\d+\s*[-–]\s*\d+)')
-            for col in subset.columns:
-                for cell in subset[col].dropna().astype(str).unique():
-                    s = cell.strip()
-                    m = score_pat.search(s)
-                    if m:
-                        resultado_partido = m.group(1).replace('\u2013', '-').strip()
-                        break
-                if resultado_partido:
-                    break
-
-        label = f"{j}."
-        if len(found_team_values) >= 2:
-            team1 = found_team_values[0]
-            team2 = found_team_values[1]
-            if resultado_partido:
-                res_str = resultado_partido.replace('-', ' - ')
-                res_str = ' '.join(res_str.split())
-                label = f"{label} {team1} {res_str} {team2}"
-            else:
-                label = f"{label} {team1} vs {team2}"
-        elif len(found_team_values) == 1:
-            label = f"{label} {found_team_values[0]}"
+    label = f"{j}."
+    if len(found_team_values) >= 2:
+        team1, team2 = found_team_values[0], found_team_values[1]
+        if resultado_partido:
+            res_str = resultado_partido.replace("-", " - ")
+            res_str = " ".join(res_str.split())
+            label = f"{label} {team1} {res_str} {team2}"
         else:
-            label = label
+            label = f"{label} {team1} vs {team2}"
+    elif len(found_team_values) == 1:
+        label = f"{label} {found_team_values[0]}"
+    return label
 
-        return label
+unique_jornadas = list(pd.unique(df_align["jornada"].dropna().values))
+jornada_labels = [make_jornada_label(df_align, j) for j in unique_jornadas]
+label_to_jornada = {lab: j for lab, j in zip(jornada_labels, unique_jornadas)}
+selected_label = st.selectbox("Selecciona jornada", jornada_labels)
+selected_jornada = label_to_jornada[selected_label]
 
-    jornada_labels = [make_jornada_label(j) for j in unique_jornadas]
-    label_to_jornada = {lab: j for lab, j in zip(jornada_labels, unique_jornadas)}
-    selected_label = st.selectbox("Selecciona jornada", jornada_labels)
-    selected_jornada = label_to_jornada[selected_label]
-
-except Exception:
-    try:
-        jornadas = sorted(df['Jornada'].dropna().unique(), key=lambda x: (int(x) if str(x).isdigit() else str(x)))
-    except Exception:
-        jornadas = sorted(df['Jornada'].dropna().unique())
-    selected_jornada = st.selectbox("Selecciona jornada", jornadas)
-
-j_df = df[df['Jornada'] == selected_jornada].copy()
+j_df = df_align[df_align["jornada"] == selected_jornada].copy()
 if j_df.empty:
     st.warning("No hay registros para la jornada seleccionada.")
     st.stop()
 
-# Identificar columna de jugador
-player_col = None
-for candidate in ['Jugador', 'Nombre', 'Player', 'player', 'jugador']:
-    if candidate in j_df.columns:
-        player_col = candidate
-        break
-if not player_col:
-    st.error('No se encontró la columna de jugador ("Jugador" o "Nombre").')
-    st.stop()
+player_col = "jugador"
 
 fecha_partido = None
-if 'Fecha Partido' in j_df.columns and not j_df['Fecha Partido'].dropna().empty:
-    fecha_partido = j_df['Fecha Partido'].dropna().iloc[0]
+if "fecha_partido" in j_df.columns and not j_df["fecha_partido"].dropna().empty:
+    fecha_partido = j_df["fecha_partido"].dropna().iloc[0]
 resultado_partido = None
-for c in ['Resultado Partido','Resultado','resultado_partido','ResultadoPartido']:
-    if c in j_df.columns:
-        nonnull = j_df[c].dropna()
-        if not nonnull.empty:
-            resultado_partido = nonnull.iloc[0]
-            break
+if "resultado_partido" in j_df.columns and not j_df["resultado_partido"].dropna().empty:
+    resultado_partido = j_df["resultado_partido"].dropna().iloc[0]
 
-# Build existing map
-existing_map = {}
-for idx, rec in enumerate(records):
-    key = (str(rec.get('Jornada')), str(rec.get('Jugador')), str(rec.get('Evaluador', '')))
-    existing_map[key] = (rec, idx)
+# Construir mapa existing por id (basado en ratings_df cargado al inicio del run)
+ratings_df_local = ratings_df.copy()
+ratings_df_local["id"] = ratings_df_local.get("id", ratings_df_local.apply(lambda r: make_row_id(r.get("Jornada", ""), r.get("Jugador", ""), r.get("Evaluador", "")), axis=1))
+existing_map = {str(r["id"]): idx for idx, r in ratings_df_local.iterrows()}
 
-# Mostrar alineación y minutos (idéntico a tu código original)
-col1, col2, col3 = st.columns([1,2,2])
+# Mostrar alineación & minutos (sin goles/asistencias numéricas)
+col1, col2, col3 = st.columns([1, 2, 2])
 with col1:
-    try:
-        st.metric("Jornada", str(selected_jornada))
-        if fecha_partido is not None and not pd.isna(fecha_partido):
-            st.write("Fecha:", fecha_partido.date())
-    except Exception:
-        st.metric("Jornada", str(selected_jornada))
+    st.metric("Jornada", str(selected_jornada))
+    if fecha_partido is not None and not pd.isna(fecha_partido):
+        st.write("Fecha:", fecha_partido.date())
 with col2:
     st.write("**Resultado**")
     st.write(resultado_partido if resultado_partido is not None else "—")
 with col3:
-    left_header_col, right_header_col = st.columns([6,1])
+    left_header_col, right_header_col = st.columns([6, 1])
     left_header_col.markdown("**Alineación (jugadores)**")
     right_header_col.markdown("**Minutos Jugados**")
 
-    top_df = j_df.copy()
-    if 'Minutos Jugados' in top_df.columns:
-        top_min_col = 'Minutos Jugados'
-    elif 'Minutos' in top_df.columns:
-        top_min_col = 'Minutos'
+    display_df = j_df.copy()
+    if "minutos" in display_df.columns:
+        display_df = display_df.sort_values(by="minutos", ascending=False).reset_index(drop=True)
     else:
-        top_min_col = None
+        display_df = display_df.reset_index(drop=True)
 
-    if top_min_col:
-        top_df['__minutos_num'] = pd.to_numeric(top_df[top_min_col], errors='coerce').fillna(0).astype(int)
-    else:
-        top_df['__minutos_num'] = 0
-
-    top_df = top_df.sort_values(by='__minutos_num', ascending=False).reset_index(drop=True)
-
-    for idx, row in top_df.iterrows():
+    for idx, row in display_df.iterrows():
         jugador = str(row[player_col])
-        minutos = row.get('Minutos Jugados', '') if 'Minutos Jugados' in row.index else row.get('Minutos', '')
-        min_text = ""
-        try:
-            if minutos not in (None, "", pd.NA) and str(minutos).strip() != "":
-                min_int = int(float(minutos))
-                min_text = f"{min_int}'"
-        except Exception:
-            min_text = str(minutos)
+        minutos = int(row["minutos"]) if "minutos" in row.index and not pd.isna(row["minutos"]) else None
+        gol = int(row["gol"]) if "gol" in row.index and not pd.isna(row["gol"]) else 0
+        asistencia = int(row["asistencia"]) if "asistencia" in row.index and not pd.isna(row["asistencia"]) else 0
 
-        gol_val = 0
-        ast_val = 0
-        try:
-            gol_val = int(row.get('Gol', 0)) if 'Gol' in row.index and not pd.isna(row.get('Gol', 0)) else 0
-        except Exception:
-            gol_val = 0
-        try:
-            ast_val = int(row.get('Asistencia', 0)) if 'Asistencia' in row.index and not pd.isna(row.get('Asistencia', 0)) else 0
-        except Exception:
-            ast_val = 0
-
-        name_col, min_col = st.columns([6,1])
+        name_col, min_col = st.columns([6, 1])
         name_col.markdown(f"**{jugador}**")
-        if gol_val >= 1 or ast_val >= 1:
-            if min_text:
-                min_col.markdown(f"**{min_text}**")
-            else:
-                min_col.write("")
+        min_text = f"{minutos}'" if minutos is not None else ""
+        if gol >= 1 or asistencia >= 1:
+            min_col.markdown(f"**{min_text}**")
         else:
-            if min_text:
-                min_col.write(min_text)
-            else:
-                min_col.write("")
+            min_col.write(min_text)
 
 st.markdown("---")
 
-# ------------------ Promedio de calificaciones YA GUARDADAS por este evaluador en esta jornada
+# Promedio de calificaciones ya guardadas por este evaluador en esta jornada
 calificaciones_guardadas = []
-for rec in records:
+for _, rec in ratings_df_local.iterrows():
     try:
-        if str(rec.get('Jornada')) == str(selected_jornada) and str(rec.get('Evaluador', '')).strip() == str(evaluador).strip():
-            cal = rec.get('Calificacion', '')
-            if cal is not None and str(cal).strip() != '':
+        if str(rec.get("Jornada")) == str(selected_jornada) and str(rec.get("Evaluador", "")).strip() == str(evaluador).strip():
+            cal = rec.get("Calificacion", "")
+            if cal is not None and str(cal).strip() != "":
                 calificaciones_guardadas.append(float(cal))
     except Exception:
         continue
 
+st.markdown("### Promedio (esta jornada — tus calificaciones guardadas)")
 if calificaciones_guardadas:
     avg_val = sum(calificaciones_guardadas) / len(calificaciones_guardadas)
-    st.markdown("### Promedio (esta jornada — tus calificaciones guardadas)")
     st.metric("Promedio", f"{avg_val:.2f}", delta=f"{len(calificaciones_guardadas)} entradas")
 else:
-    st.markdown("### Promedio (esta jornada — tus calificaciones guardadas)")
     st.info("Aún no hay calificaciones guardadas por este evaluador para esta jornada.")
 
-# Form para ingresar calificaciones
+# Form para ingresar calificaciones (AQUÍ SÍ mostramos Gol/Asistencia para referencia)
 st.subheader("Ingresa calificaciones")
 visible_df = j_df.copy().reset_index(drop=True)
+if "minutos" not in visible_df.columns:
+    visible_df["minutos"] = 0
+visible_df = visible_df.sort_values(by="minutos", ascending=False).reset_index(drop=True)
 
-if 'Minutos Jugados' in visible_df.columns:
-    min_col_name = 'Minutos Jugados'
-elif 'Minutos' in visible_df.columns:
-    min_col_name = 'Minutos'
-else:
-    min_col_name = None
+# Preparamos mapping id -> timestamp tal como existía al cargar el formulario
+initial_timestamps_by_id: Dict[str, str] = {}
+for idx, row in ratings_df_local.iterrows():
+    rid = str(row.get("id", "")).strip()
+    if rid:
+        initial_timestamps_by_id[rid] = str(row.get("timestamp", "") or "")
 
-if min_col_name:
-    visible_df['__minutos_num'] = pd.to_numeric(visible_df[min_col_name], errors='coerce').fillna(0).astype(int)
-else:
-    visible_df['__minutos_num'] = 0
+ratings_to_write: List[dict] = []
 
-visible_df = visible_df.sort_values(by='__minutos_num', ascending=False).reset_index(drop=True)
-
-with st.form("ratings_form_optimized"):
-    ratings_to_write = []
-    for local_idx, (orig_idx, row) in enumerate(visible_df.iterrows()):
+with st.form("ratings_form_improved"):
+    for local_idx, row in visible_df.iterrows():
         jugador = str(row[player_col])
-        minutos = row.get('Minutos Jugados', '') if 'Minutos Jugados' in row.index else row.get('Minutos', '')
-        gol = int(row.get('Gol', 0)) if 'Gol' in row.index and not pd.isna(row.get('Gol', 0)) else 0
-        asistencia = int(row.get('Asistencia', 0)) if 'Asistencia' in row.index and not pd.isna(row.get('Asistencia', 0)) else 0
+        minutos = int(row["minutos"]) if not pd.isna(row["minutos"]) else None
+        gol = int(row["gol"]) if "gol" in row.index and not pd.isna(row["gol"]) else 0
+        asistencia = int(row["asistencia"]) if "asistencia" in row.index and not pd.isna(row["asistencia"]) else 0
 
         key = (str(selected_jornada), jugador, str(evaluador))
+        rid = make_row_id(*key)
         default_val = 6.0
-        if key in existing_map:
-            rec_existing, rec_idx = existing_map[key]
+        if rid in existing_map:
             try:
-                if rec_existing.get('Calificacion', '') != '':
-                    default_val = float(rec_existing.get('Calificacion', default_val))
+                existing_row = ratings_df_local.loc[int(existing_map[rid])]
+                if existing_row.get("Calificacion", "") != "":
+                    default_val = float(existing_row.get("Calificacion", default_val))
             except Exception:
-                default_val = default_val
+                pass
 
-        a_col, b_col, c_col = st.columns([6,2,1])
+        a_col, b_col, c_col = st.columns([6, 2, 1])
         with a_col:
-            min_display = minutos if minutos not in (None, '') else '—'
-            block = f"{jugador}  \n_min: {min_display}_  \nGol: {gol}  •  Ast: {asistencia}"
-            st.markdown(f"**{block}**")
-
+            min_display = f"{minutos}'" if minutos is not None else "—"
+            info_rest = f"_min: {min_display}_  \nGol: {gol}  •  Ast: {asistencia}"
+            if gol >= 1 or asistencia >= 1:
+                st.markdown(f"**{jugador}  \n{info_rest}**")
+            else:
+                st.markdown(f"**{jugador}**  \n{info_rest}")
         with b_col:
-            cal_key = f"cal_{selected_jornada}_{orig_idx}_{evaluador}"
+            cal_key = f"cal_{safe_key(selected_jornada)}_{local_idx}_{safe_key(evaluador)}"
             cal_val = st.number_input("", min_value=0.0, max_value=10.0, value=float(default_val), step=0.5, key=cal_key, label_visibility="collapsed")
         with c_col:
             st.write("")
 
         rec = {
-            'Jornada': str(selected_jornada),
-            'Jugador': jugador,
-            'Evaluador': str(evaluador),
-            'Calificacion': float(cal_val),
-            'Minutos': minutos if minutos != '' and minutos is not None else None,
-            'Gol': int(gol),
-            'Asistencia': int(asistencia),
-            'Resultado': str(resultado_partido) if resultado_partido is not None else '',
-            'Fecha Partido': fecha_partido.isoformat() if fecha_partido is not None and not pd.isna(fecha_partido) else None,
-            'timestamp': datetime.utcnow().isoformat()
+            "id": rid,
+            "Jornada": str(selected_jornada),
+            "Jugador": jugador,
+            "Evaluador": str(evaluador),
+            "Calificacion": float(cal_val),
+            "Minutos": minutos if (not pd.isna(minutos) and minutos not in (None, "")) else "",
+            "Gol": int(gol),
+            "Asistencia": int(asistencia),
+            "Resultado": str(resultado_partido) if resultado_partido is not None else "",
+            "Fecha Partido": fecha_partido.isoformat() if fecha_partido is not None and not pd.isna(fecha_partido) else "",
+            "timestamp": now_utc_iso(),
         }
         ratings_to_write.append(rec)
 
     submitted = st.form_submit_button("Guardar calificaciones")
 
-# Guardado en Google Sheets (idéntico a tu lógica original)
+# Guardado (append/update por id) con writes condicionales y batch_update
 if submitted:
-    try:
-        records = ratings_ws.get_all_records()
-        headers = ['Jornada','Jugador','Evaluador','Calificacion','Minutos','Gol','Asistencia','Resultado','Fecha Partido','timestamp']
-
-        all_recs = []
-        for r in records:
-            rec_row = {
-                'Jornada': r.get('Jornada', ''),
-                'Jugador': r.get('Jugador', ''),
-                'Evaluador': r.get('Evaluador', ''),
-                'Calificacion': r.get('Calificacion', ''),
-                'Minutos': r.get('Minutos', ''),
-                'Gol': r.get('Gol', ''),
-                'Asistencia': r.get('Asistencia', ''),
-                'Resultado': r.get('Resultado', ''),
-                'Fecha Partido': r.get('Fecha Partido', ''),
-                'timestamp': r.get('timestamp', '')
-            }
-            all_recs.append(rec_row)
-
-        key_to_idx = {}
-        for i, r in enumerate(all_recs):
-            key = (str(r.get('Jornada')), str(r.get('Jugador')), str(r.get('Evaluador', '')))
-            key_to_idx[key] = i
-
-        for r in ratings_to_write:
-            key = (str(r['Jornada']), str(r['Jugador']), str(r['Evaluador']))
-            if key in key_to_idx:
-                idx = key_to_idx[key]
-                all_recs[idx]['Calificacion'] = r.get('Calificacion')
-                all_recs[idx]['Minutos'] = r.get('Minutos')
-                all_recs[idx]['Gol'] = r.get('Gol')
-                all_recs[idx]['Asistencia'] = r.get('Asistencia')
-                all_recs[idx]['Resultado'] = r.get('Resultado')
-                all_recs[idx]['Fecha Partido'] = r.get('Fecha Partido')
-                all_recs[idx]['timestamp'] = r.get('timestamp')
-            else:
-                new_rec = {
-                    'Jornada': r.get('Jornada'),
-                    'Jugador': r.get('Jugador'),
-                    'Evaluador': r.get('Evaluador'),
-                    'Calificacion': r.get('Calificacion'),
-                    'Minutos': r.get('Minutos'),
-                    'Gol': r.get('Gol'),
-                    'Asistencia': r.get('Asistencia'),
-                    'Resultado': r.get('Resultado'),
-                    'Fecha Partido': r.get('Fecha Partido'),
-                    'timestamp': r.get('timestamp')
-                }
-                key_to_idx[key] = len(all_recs)
-                all_recs.append(new_rec)
-
-        rows_to_write = [headers]
-        for r in all_recs:
-            rows_to_write.append([
-                r.get('Jornada', ''),
-                r.get('Jugador', ''),
-                r.get('Evaluador', ''),
-                r.get('Calificacion', ''),
-                r.get('Minutos', ''),
-                r.get('Gol', ''),
-                r.get('Asistencia', ''),
-                r.get('Resultado', ''),
-                r.get('Fecha Partido', ''),
-                r.get('timestamp', '')
-            ])
-
-        max_retries = 5
-        backoff = 1.0
-        last_err = None
-        for attempt in range(max_retries):
+    if st.session_state.get("submitted_jornada") == selected_jornada:
+        st.warning("Ya enviaste calificaciones para esta jornada en esta sesión. Evita envíos duplicados.")
+    else:
+        # Prevención: si ya hay un guardado en proceso en esta sesión, lo bloqueamos
+        if st.session_state.get("saving_in_progress", False):
+            st.warning("Ya hay un guardado en curso en esta sesión. Espera a que termine.")
+        else:
+            st.session_state["saving_in_progress"] = True
+            saved_ok = False
             try:
-                ratings_ws.update('A1', rows_to_write)
-                st.success(f"Guardadas/actualizadas {len(ratings_to_write)} calificaciones en Google Sheets (operación por lote).")
-                last_err = None
-                break
-            except APIError as e:
-                last_err = e
-                st.warning(f"APIError intentando escribir (intento {attempt+1}/{max_retries}): {e}")
-                time.sleep(backoff)
-                backoff *= 2.0
-            except Exception as e:
-                last_err = e
-                st.error(f"Error no esperado al actualizar Google Sheets: {e}")
-                st.exception(e)
-                break
+                with st.spinner("Guardando calificaciones..."):
+                    # Leemos solo ids y timestamps para comprobar colisiones y para construir id->rownum
+                    id_to_rownum, id_to_ts = read_ratings_index(ratings_ws)
 
-        if last_err:
-            st.error("No se pudo guardar las calificaciones después de varios intentos.")
-            st.exception(last_err)
+                    rows_to_append: List[List] = []
+                    batch_updates: List[Dict] = []
+                    skipped_due_to_collision: List[str] = []
+                    updated_count = 0
+                    appended_count = 0
 
-        # Refrescar records y mapa local
-        records = ratings_ws.get_all_records()
-        existing_map = {}
-        for idx, rec in enumerate(records):
-            key = (str(rec.get('Jornada')), str(rec.get('Jugador')), str(rec.get('Evaluador', '')))
-            existing_map[key] = (rec, idx)
+                    for r in ratings_to_write:
+                        r_clean = normalize_and_validate_record(r)
+                        rid = r_clean["id"]
+                        row_values = [
+                            rid,
+                            r_clean["Jornada"],
+                            r_clean["Jugador"],
+                            r_clean["Evaluador"],
+                            r_clean["Calificacion"],
+                            r_clean["Minutos"],
+                            r_clean["Gol"],
+                            r_clean["Asistencia"],
+                            r_clean["Resultado"],
+                            r_clean["Fecha Partido"],
+                            r_clean["timestamp"],
+                        ]
+                        if rid in id_to_rownum:
+                            try:
+                                rownum = id_to_rownum[rid]
+                                existing_ts = id_to_ts.get(rid, "")
+                                initial_ts = initial_timestamps_by_id.get(rid, "")
+                                if initial_ts and existing_ts and existing_ts != initial_ts:
+                                    skipped_due_to_collision.append(r_clean["Jugador"])
+                                    logger.info(f"Salteando actualización por colisión (id={rid}, jugador={r_clean['Jugador']}). initial_ts={initial_ts}, existing_ts={existing_ts}")
+                                    continue
 
-    except Exception as e:
-        st.error("Error procesando guardado por lote.")
-        st.exception(e)
+                                # Leemos la fila existente para comparar (lectura puntual)
+                                try:
+                                    existing_row_values = retry_with_backoff(lambda: ratings_ws.row_values(rownum))
+                                except Exception:
+                                    existing_row_values = []
 
-# Mostrar calificaciones guardadas (filtrado por jornada y evaluador)
-st.subheader("Calificaciones guardadas (esta jornada)")
+                                # Alinear longitud
+                                existing_values = [str(existing_row_values[i]) if i < len(existing_row_values) else "" for i in range(len(row_values))]
+                                new_values = [str(v) if v is not None else "" for v in row_values]
 
-rows_show = []
-for key, (rec, idx) in existing_map.items():
-    j, player, evalr = key
-    if str(j) == str(selected_jornada):
-        if str(evalr) != str(evaluador):
-            continue
-        rows_show.append({
-            'Jornada': rec.get('Jornada'),
-            'Jugador': rec.get('Jugador'),
-            'Evaluador': rec.get('Evaluador'),
-            'Calificacion': rec.get('Calificacion'),
-            'Minutos': rec.get('Minutos'),
-            'Gol': rec.get('Gol'),
-            'Asistencia': rec.get('Asistencia'),
-            'Resultado': rec.get('Resultado'),
-            'Fecha Partido': rec.get('Fecha Partido'),
-            'timestamp': rec.get('timestamp')
-        })
+                                if existing_values != new_values:
+                                    last_col_letter = chr(ord("A") + len(row_values) - 1)
+                                    rng = f"A{rownum}:{last_col_letter}{rownum}"
+                                    batch_updates.append({"range": rng, "values": [row_values]})
+                                    updated_count += 1
+                                else:
+                                    logger.debug(f"No hay cambios para id={rid}, jugador={r_clean['Jugador']}. Omitiendo update.")
+                            except Exception:
+                                rownum = id_to_rownum.get(rid)
+                                if rownum:
+                                    last_col_letter = chr(ord("A") + len(row_values) - 1)
+                                    rng = f"A{rownum}:{last_col_letter}{rownum}"
+                                    batch_updates.append({"range": rng, "values": [row_values]})
+                                    updated_count += 1
+                        else:
+                            rows_to_append.append(row_values)
+                            appended_count += 1
 
-if rows_show:
-    df_display = pd.DataFrame(rows_show).sort_values(by='Calificacion', ascending=False)
-    st.dataframe(df_display.reset_index(drop=True))
+                    # Ejecutar updates
+                    if batch_updates:
+                        try:
+                            batch_update_rows(ratings_ws.spreadsheet, batch_updates)
+                        except Exception:
+                            logger.exception("Error realizando batch updates; intentando updates individuales como fallback")
+                            for upd in batch_updates:
+                                rng = upd["range"]
+                                vals = upd["values"]
+                                try:
+                                    retry_with_backoff(lambda: ratings_ws.update(rng, vals, value_input_option="USER_ENTERED"))
+                                except Exception:
+                                    logger.exception(f"Error actualizando rango {rng} (fallback).")
+
+                    # Ejecutar appends en batches para robustez y evitar timeouts
+                    if rows_to_append:
+                        try:
+                            # chunk size configurable
+                            CHUNK = 200
+                            for i in range(0, len(rows_to_append), CHUNK):
+                                chunk = rows_to_append[i : i + CHUNK]
+                                append_rows(ratings_ws, chunk)
+                                # Tras cada append chunk refrescamos el índice para evitar que
+                                # el mismo run termine creando duplicados
+                                id_to_rownum, id_to_ts = read_ratings_index(ratings_ws)
+                        except Exception:
+                            logger.exception("Error haciendo append_rows")
+
+                    st.session_state["submitted_jornada"] = selected_jornada
+                    msg = f"Guardadas/actualizadas: {updated_count} actualizaciones, {appended_count} nuevas."
+                    if skipped_due_to_collision:
+                        msg += f" {len(skipped_due_to_collision)} filas saltadas por colisión: {', '.join(skipped_due_to_collision)}."
+                        st.warning(f"Se saltaron {len(skipped_due_to_collision)} filas porque fueron modificadas por otra sesión (ver detalles).")
+                    st.success(msg)
+                    logger.info(msg)
+
+                    _session_cache_invalidate("ratings::")
+                    try:
+                        refreshed = safe_get_all_records(ratings_ws)
+                        ratings_df = pd.DataFrame(refreshed) if refreshed else pd.DataFrame()
+                    except Exception:
+                        logger.exception("No se pudo refrescar calificaciones tras guardado.")
+
+                    saved_ok = True
+
+            except Exception:
+                logger.exception("Error procesando guardado por lote")
+                st.error("Ocurrió un error al guardar. Revisa logs.")
+            finally:
+                # liberar el lock siempre
+                st.session_state["saving_in_progress"] = False
+
+            # Forzar rerun seguro si todo se guardó
+            if 'saved_ok' in locals() and saved_ok:
+                try:
+                    params = dict(st.query_params)
+                    params['_ts'] = [str(time.time())]
+                    st.query_params = params
+                except Exception:
+                    logger.exception('No se pudo forzar rerun vía query params; intentando st.experimental_rerun() como fallback')
+                    try:
+                        st.experimental_rerun()
+                    except Exception:
+                        logger.exception('st.experimental_rerun() lanzó excepción en el fallback (se ignora).')
+
+# ======================
+# Descarga: todas las calificaciones del evaluador (SIN mostrar tabla)
+# ======================
+st.markdown("---")
+st.subheader("Descargar calificaciones")
+
+try:
+    all_records = safe_get_all_records(ratings_ws)
+    all_df = pd.DataFrame(all_records) if all_records else pd.DataFrame(columns=EXPECTED_RATINGS_HEADERS)
+    if "Evaluador" not in all_df.columns:
+        all_df["Evaluador"] = None
+    df_user = all_df[all_df["Evaluador"].astype(str).str.strip() == str(evaluador).strip()].copy()
+except Exception:
+    logger.exception("Error leyendo todas las calificaciones para descarga")
+    df_user = pd.DataFrame(columns=EXPECTED_RATINGS_HEADERS)
+
+if df_user.empty:
+    st.info("No se encontraron calificaciones guardadas por este evaluador.")
+    try:
+        st.download_button(
+            "Descargar todas mis calificaciones (evaluador)",
+            data="",
+            file_name=f"calificaciones_{safe_key(evaluador)}.csv",
+            mime="text/csv",
+            disabled=True,
+        )
+    except TypeError:
+        pass
 else:
-    st.info("No hay calificaciones guardadas por este evaluador para esta jornada.")
+    try:
+        # transformaciones pedidas: eliminar columnas id y timestamp; formatear Fecha Partido a solo fecha
+        df_export = df_user.copy()
+        for c in ["id", "timestamp"]:
+            if c in df_export.columns:
+                df_export.drop(columns=[c], inplace=True)
+
+        if "Fecha Partido" in df_export.columns:
+            try:
+                df_export["Fecha Partido"] = pd.to_datetime(df_export["Fecha Partido"], errors="coerce").dt.date
+                # convertir a string YYYY-MM-DD y rellenar vacíos
+                df_export["Fecha Partido"] = df_export["Fecha Partido"].apply(lambda d: d.isoformat() if pd.notna(d) else "")
+            except Exception:
+                logger.exception("No se pudo formatear 'Fecha Partido' al exportar; se deja como estaba.")
+
+        csv_str = df_export.to_csv(index=False)
+    except TypeError:
+        try:
+            import csv
+
+            buf = io.StringIO()
+            writer = csv.DictWriter(buf, fieldnames=list(df_export.columns))
+            writer.writeheader()
+            for row in df_export.to_dict(orient="records"):
+                safe_row = {k: ("" if v is None else v) for k, v in row.items()}
+                writer.writerow(safe_row)
+            csv_str = buf.getvalue()
+        except Exception:
+            rows = [",".join([str(c) for c in df_export.columns])]
+            for rec in df_export.to_dict(orient="records"):
+                rows.append(",".join([str(rec.get(c, "")) for c in df_export.columns]))
+            csv_str = "\n".join(rows) + "\n"
+
+    csv_bytes = csv_str.encode("utf-8-sig")
+    st.download_button(
+        "Descargar todas mis calificaciones (evaluador)",
+        data=csv_bytes,
+        file_name=f"calificaciones_{safe_key(evaluador)}.csv",
+        mime="text/csv",
+    )
+
+# Fin del archivo
