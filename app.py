@@ -1,14 +1,9 @@
 # app.py
 """
 Streamlit app — Calificar Alineaciones — Google Sheets
-Versión: mejoras de seguridad y robustez (sin cambiar funcionalidad).
-Cambios recientes:
-- Primera sección: no se muestran goles/asistencias (solo nombre y minutos).
-- Correcciones: manejo seguro de pd.NA y comportamiento de negritas por gol/asistencia.
-- Tras guardar, se fuerza rerun para recalcular promedios inmediatamente.
-- Al final: en lugar de mostrar tabla por jornada, hay UN SOLO botón que descarga
-  todas las calificaciones del evaluador (sin mostrar tabla).
-Mantiene la lógica original: ids, append/update por id, formularios, etc.
+Versión: mejoras de seguridad y robustez (batch updates, writes condicionales,
+detección de colisiones, cache ligera, validación de headers, last sync, etc.)
+Mantiene la lógica funcional original (ids, append/update por id, formularios).
 """
 
 import base64
@@ -22,7 +17,7 @@ import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
@@ -40,29 +35,21 @@ if not logger.handlers:
     logger.addHandler(ch)
 
 # -------- SECURITY NOTE / DEBUG (NON-VERBOSE) --------
-# Si estás en desarrollo y guardaste la ruta en st.secrets, el código
-# permitirá usarla pero NUNCA imprimirá la ruta ni el contenido en la UI.
-# Evita exponer secretos en textos visibles.
 if "GOOGLE_APPLICATION_CREDENTIALS" in st.secrets:
-    # Solo establecer la env var si no existe (útil en local). No lo mostramos.
     if not os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
         try:
             os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = st.secrets["GOOGLE_APPLICATION_CREDENTIALS"]
             logger.debug("Se estableció GOOGLE_APPLICATION_CREDENTIALS desde st.secrets (no mostrado).")
         except Exception:
             logger.exception("No se pudo asignar GOOGLE_APPLICATION_CREDENTIALS desde st.secrets.")
-# No st.write ni prints que muestren rutas/secretos.
 
 # -------- CONSTANTS / CONFIG --------
-# Cambia aquí la URL de tu Google Sheet
 SHEET_URL = "https://docs.google.com/spreadsheets/d/1OQRTq818EXBeibBmWlrcSZm83do264l2mb5jnBmzsu8"
 ALIGN_WORKSHEET_NAME = "Alineaciones"
 RATINGS_SHEET_NAME = "Calificaciones"
 
-# Scope reducido: solo spreadsheets (suficiente para leer/escribir)
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
-# Column mapping para normalizar nombres de columnas de la hoja de alineaciones
 COLUMN_MAP = {
     "Minutos Jugados": "minutos",
     "Minutos": "minutos",
@@ -92,14 +79,11 @@ EXPECTED_RATINGS_HEADERS = [
     "timestamp",
 ]
 
-# ------- Helpers -------
-
+# -------- Helpers --------
 def safe_key(s: str) -> str:
-    """Sanitiza valores para usarlos como keys de Streamlit widgets."""
     return re.sub(r"[^a-zA-Z0-9_\-]", "_", str(s or ""))
 
 def make_row_id(jornada: str, jugador: str, evaluador: str) -> str:
-    """Genera un id único a partir de jornada+jugador+evaluador."""
     base = f"{jornada}|{jugador}|{evaluador}"
     return hashlib.sha1(base.encode("utf-8")).hexdigest()
 
@@ -112,10 +96,8 @@ def safe_get(d: dict, k: str, default=None):
         return v.strip()
     return v
 
-# -------- Retry wrapper (ya existente, sin cambios funcionales) --------
-
+# Retry wrapper (ya existente, sin cambios funcionales excepto logging)
 def retry_with_backoff(func, max_retries=5, base=1.0, max_backoff=16.0, *args, **kwargs):
-    """Wrapper simple para retries con backoff y jitter."""
     attempt = 0
     last_exc = None
     while attempt < max_retries:
@@ -129,32 +111,19 @@ def retry_with_backoff(func, max_retries=5, base=1.0, max_backoff=16.0, *args, *
             time.sleep(wait + jitter)
             last_exc = e
         except Exception as e:
-            # error no recuperable
             logger.exception("Error no recuperable en operación gspread")
             raise
-    # si llegamos aquí, re-lanzar última excepción
     raise last_exc
 
-# safe get_all_records con backoff para lecturas
 def safe_get_all_records(ws):
     try:
         return retry_with_backoff(lambda: ws.get_all_records())
     except Exception:
         logger.exception("Fallo seguro al leer get_all_records()")
-        # devolver lista vacía para que la lógica superior lo maneje
         return []
 
-# -------- Credenciales & gspread (mejora: cache client) --------
-
+# Credenciales & gspread (cacheado cliente)
 def get_credentials_from_st_secrets_or_env(scopes):
-    """
-    Orden:
-     1) st.secrets["SERVICE_ACCOUNT_JSON"]  (string JSON o dict)
-     2) st.secrets["gcp_service_account"]   (map/dict)
-     3) GOOGLE_APPLICATION_CREDENTIALS env var (path)
-    Nota: No usar fallback a archivos locales en producción.
-    """
-    # 1) SERVICE_ACCOUNT_JSON
     try:
         if "SERVICE_ACCOUNT_JSON" in st.secrets:
             sa_raw = st.secrets["SERVICE_ACCOUNT_JSON"]
@@ -166,7 +135,6 @@ def get_credentials_from_st_secrets_or_env(scopes):
     except Exception:
         logger.exception("SERVICE_ACCOUNT_JSON presente pero no parseable")
 
-    # 2) gcp_service_account
     try:
         if "gcp_service_account" in st.secrets:
             sa_info = st.secrets["gcp_service_account"]
@@ -174,7 +142,6 @@ def get_credentials_from_st_secrets_or_env(scopes):
     except Exception:
         logger.exception("gcp_service_account presente pero no válido")
 
-    # 3) GOOGLE_APPLICATION_CREDENTIALS (path)
     gpath = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
     if gpath:
         try:
@@ -182,20 +149,15 @@ def get_credentials_from_st_secrets_or_env(scopes):
         except Exception:
             logger.exception("Error cargando GOOGLE_APPLICATION_CREDENTIALS")
 
-    # Si no hay credenciales -> None
     return None
 
-# Cacheado del cliente gspread para rendimiento (no cambia funcionalidad).
-# hash_funcs evita intentar hashear Credentials (puede fallar).
 @st.cache_resource(hash_funcs={Credentials: lambda _: None})
 def get_gspread_client_cached(creds):
-    """Devuelve un client gspread autorizado (cacheado para la sesión/app)."""
     if creds is None:
         return None
     return gspread.authorize(creds)
 
 def connect_gsheets(creds, sheet_url):
-    """Conectar y devolver el objeto Spreadsheet (usa client cacheado)."""
     if creds is None:
         return None
     try:
@@ -209,26 +171,66 @@ def connect_gsheets(creds, sheet_url):
         return None
 
 def get_or_create_ratings_ws(sh, title=RATINGS_SHEET_NAME):
-    """Obtiene o crea la worksheet de calificaciones. Añade columna 'id' si es necesario."""
     try:
         try:
             ws = sh.worksheet(title)
         except Exception:
             ws = sh.add_worksheet(title=title, rows="2000", cols="20")
-        # Ensure headers exist and include 'id'
         headers = ws.row_values(1)
-        if not headers or len(headers) < len(EXPECTED_RATINGS_HEADERS) or headers[0].strip().lower() != "id":
-            # reescribimos cabecera en A1
+        if not headers or len(headers) < len(EXPECTED_RATINGS_HEADERS) or (headers and headers[0].strip().lower() != "id"):
             ws.update("A1", [EXPECTED_RATINGS_HEADERS])
         return ws
     except Exception:
         logger.exception("Error obteniendo/creando la pestaña de Calificaciones")
         return None
 
-# ---------------- Reads (comentados caches previos) ----------------
-# NOTA: no estamos usando st.cache_data aquí en depuración; si quieres reactivar, hacerlo con cuidado.
-def load_alignments(sh, worksheet_name=ALIGN_WORKSHEET_NAME) -> pd.DataFrame:
-    """Carga la hoja de alineaciones y normaliza columnas."""
+# ---------------- Simple in-memory cache (session_state) con TTL ----------------
+def _session_cache_get(key: str):
+    entry = st.session_state.get("_cache_internal", {}).get(key)
+    if not entry:
+        return None
+    value, ts, ttl = entry.get("value"), entry.get("ts"), entry.get("ttl")
+    if (time.time() - ts) > ttl:
+        # expired
+        st.session_state["_cache_internal"].pop(key, None)
+        return None
+    return value
+
+def _session_cache_set(key: str, value, ttl: int = 30):
+    if "_cache_internal" not in st.session_state:
+        st.session_state["_cache_internal"] = {}
+    st.session_state["_cache_internal"][key] = {"value": value, "ts": time.time(), "ttl": ttl}
+
+def _session_cache_invalidate(key_prefix: str):
+    if "_cache_internal" not in st.session_state:
+        return
+    for k in list(st.session_state["_cache_internal"].keys()):
+        if k.startswith(key_prefix):
+            st.session_state["_cache_internal"].pop(k, None)
+
+# ---------------- Reads (usando cache ligera) ----------------
+def load_alignments_cached(sh, worksheet_name=ALIGN_WORKSHEET_NAME, ttl_seconds=30) -> pd.DataFrame:
+    cache_key = f"alignments::{worksheet_name}::{SHEET_URL}"
+    cached = _session_cache_get(cache_key)
+    if cached is not None:
+        return cached
+    df = load_alignments_uncached(sh, worksheet_name)
+    _session_cache_set(cache_key, df, ttl=ttl_seconds)
+    # store last sync
+    st.session_state["last_sync_alignments"] = now_utc_iso()
+    return df
+
+def load_ratings_cached(ws, ttl_seconds=15) -> pd.DataFrame:
+    cache_key = f"ratings::{ws.id if hasattr(ws,'id') else 'unknown'}::{SHEET_URL}"
+    cached = _session_cache_get(cache_key)
+    if cached is not None:
+        return cached
+    df = load_ratings_uncached(ws)
+    _session_cache_set(cache_key, df, ttl=ttl_seconds)
+    st.session_state["last_sync_ratings"] = now_utc_iso()
+    return df
+
+def load_alignments_uncached(sh, worksheet_name=ALIGN_WORKSHEET_NAME) -> pd.DataFrame:
     try:
         try:
             ws_align = sh.worksheet(worksheet_name)
@@ -244,7 +246,6 @@ def load_alignments(sh, worksheet_name=ALIGN_WORKSHEET_NAME) -> pd.DataFrame:
             if col in COLUMN_MAP:
                 rename_map[col] = COLUMN_MAP[col]
             else:
-                # try lowercase match
                 low = str(col).strip().lower()
                 for k, v in COLUMN_MAP.items():
                     if k.lower() == low:
@@ -261,47 +262,42 @@ def load_alignments(sh, worksheet_name=ALIGN_WORKSHEET_NAME) -> pd.DataFrame:
                 df[ncol] = pd.to_numeric(df[ncol], errors="coerce").fillna(0).astype(int)
         return df
     except Exception:
-        logger.exception("Error cargando la hoja de alineaciones")
+        logger.exception("Error cargando la hoja de alineaciones (uncached)")
         return pd.DataFrame()
 
-def load_ratings(ws) -> pd.DataFrame:
-    """Carga la worksheet de calificaciones en un DataFrame (sin cache para debug)."""
+def load_ratings_uncached(ws) -> pd.DataFrame:
     try:
         records = safe_get_all_records(ws)
         if not records:
             return pd.DataFrame(columns=EXPECTED_RATINGS_HEADERS)
         df = pd.DataFrame(records)
-        # Asegurar columnas mínimas
         for col in ["id", "Jornada", "Jugador", "Evaluador", "Calificacion", "timestamp"]:
             if col not in df.columns:
                 df[col] = None
         return df
     except Exception:
-        logger.exception("Error leyendo calificaciones")
+        logger.exception("Error leyendo calificaciones (uncached)")
         return pd.DataFrame()
 
-# -------- Write helpers (append/update por id) --------
-
+# -------- Write helpers (batch update / append, condicional) --------
 def append_rows(ws, rows):
-    """Append multiple rows robustamente con retries."""
     if not rows:
         return
     retry_with_backoff(lambda: ws.append_rows(rows, value_input_option="USER_ENTERED"))
 
-def update_row(ws, row_index: int, row_values: list):
-    """Actualiza una fila específica (1-based index). row_values debe ser lista de celdas."""
-    # construye rango A{row}:K{row} basado en longitud
-    last_col_letter = chr(ord("A") + len(row_values) - 1)
-    range_a1 = f"A{row_index}:{last_col_letter}{row_index}"
-    retry_with_backoff(lambda: ws.update(range_a1, [row_values], value_input_option="USER_ENTERED"))
+def batch_update_rows(spreadsheet, updates: List[Dict]):
+    """
+    updates: list of {"range": "A2:K2", "values": [[...]]}
+    """
+    if not updates:
+        return
+    body = {"valueInputOption": "USER_ENTERED", "data": updates}
+    retry_with_backoff(lambda: spreadsheet.batch_update(body))
 
-# -------- Validaciones mínimas (no cambian lógica) --------
-
+# normalize & validate record (sin cambios de comportamiento salvo logging)
 def normalize_and_validate_record(r: dict) -> dict:
-    """Ajustes mínimos antes de escribir: clamp calificación 0-10, minutos a int o ''."""
     out = dict(r)
     try:
-        # Calificacion clamp
         cal = out.get("Calificacion", "")
         if cal is None or cal == "":
             out["Calificacion"] = ""
@@ -311,19 +307,17 @@ def normalize_and_validate_record(r: dict) -> dict:
                 c = 0.0
             if c > 10:
                 c = 10.0
-            out["Calificacion"] = float(round(c * 2) / 2)  # mantener paso 0.5 como en widget
+            out["Calificacion"] = float(round(c * 2) / 2)
     except Exception:
         out["Calificacion"] = ""
     try:
         m = out.get("Minutos", "")
-        # usar pd.isna para cubrir pd.NA / NaN / None
         if pd.isna(m) or m in (None, ""):
             out["Minutos"] = ""
         else:
             out["Minutos"] = int(m)
     except Exception:
         out["Minutos"] = ""
-    # Gol / Asistencia to int
     try:
         out["Gol"] = int(out.get("Gol", 0) or 0)
     except Exception:
@@ -335,7 +329,6 @@ def normalize_and_validate_record(r: dict) -> dict:
     return out
 
 # -------- App UI / Logic --------
-
 st.title("Calificar jugadores por jornada")
 
 # Sidebar: logo opcional
@@ -374,7 +367,6 @@ if creds is None:
     st.sidebar.error("No se encontraron credenciales válidas. Añade `gcp_service_account` o `SERVICE_ACCOUNT_JSON` en Streamlit Secrets o define GOOGLE_APPLICATION_CREDENTIALS.")
     st.stop()
 
-# Uso de la función con client cacheado (mejora de rendimiento)
 sh = connect_gsheets(creds, SHEET_URL)
 if sh is None:
     st.error("No se pudo conectar con la Google Sheet. Revisa las credenciales/URL.")
@@ -385,24 +377,19 @@ if ratings_ws is None:
     st.error("No se pudo obtener o crear la pestaña de Calificaciones.")
     st.stop()
 
-# Cargar datos (sin cache mientras depuramos)
-df_align = load_alignments(sh, ALIGN_WORKSHEET_NAME)
+# Cargar datos (usando cache ligero)
+df_align = load_alignments_cached(sh, ALIGN_WORKSHEET_NAME)
 if df_align is None or df_align.empty:
     st.error(f"La hoja '{ALIGN_WORKSHEET_NAME}' está vacía o no tiene registros legibles.")
     st.stop()
 
-# Load ratings (sin cache mientras depuramos)
-ratings_df = load_ratings(ratings_ws)
+ratings_df = load_ratings_cached(ratings_ws)
 
 # Session state defaults
-if "first_load" not in st.session_state:
-    st.session_state["first_load"] = True
-if "evaluador" not in st.session_state:
-    st.session_state["evaluador"] = ""
-if "pending_new_eval" not in st.session_state:
-    st.session_state["pending_new_eval"] = ""
-if "submitted_jornada" not in st.session_state:
-    st.session_state["submitted_jornada"] = None  # to prevent double-submits per jornada
+st.session_state.setdefault("first_load", True)
+st.session_state.setdefault("evaluador", "")
+st.session_state.setdefault("pending_new_eval", "")
+st.session_state.setdefault("submitted_jornada", None)
 
 # Sidebar: evaluador
 existing_evaluadores = sorted({str(r).strip() for r in ratings_df["Evaluador"].dropna().unique()}) if not ratings_df.empty else []
@@ -439,7 +426,6 @@ if selected_eval == create_option:
     if new_eval.strip() == "":
         st.sidebar.error("El nombre no puede estar vacío.")
         st.stop()
-    # set
     st.session_state["evaluador"] = new_eval.strip()
     st.session_state["pending_new_eval"] = new_eval.strip()
     st.session_state["first_load"] = False
@@ -458,17 +444,21 @@ st.sidebar.markdown("---")
 st.sidebar.markdown(f"**Evaluando:**  \n`{evaluador}`")
 st.sidebar.markdown("")
 
-# ---------------- Selección jornada y etiqueta ----------------
-if "jornada" not in df_align.columns:
-    st.error('La columna "Jornada" no está presente en la hoja de alineaciones. Actualiza la sheet.')
+# ---------------- Validación de esquema de alignments ----------------
+missing_cols = []
+for exp in ["jornada", "jugador"]:
+    if exp not in df_align.columns:
+        missing_cols.append(exp)
+if missing_cols:
+    st.error(f"Columnas esperadas faltantes en '{ALIGN_WORKSHEET_NAME}': {missing_cols}. Revisa la sheet.")
     st.stop()
 
+# ---------------- Selección jornada y etiqueta ----------------
 def make_jornada_label(df, j):
     subset = df[df["jornada"] == j]
     found_team_values = []
     resultado_partido = None
 
-    # intento de extraer 'resultado_partido' de columnas conocidas
     if "resultado_partido" in subset.columns:
         nonnull = subset["resultado_partido"].dropna()
         if not nonnull.empty:
@@ -479,7 +469,6 @@ def make_jornada_label(df, j):
                 if m2:
                     resultado_partido = m2.group(1).replace("\u2013", "-").strip()
 
-    # buscar nombres de equipo en columnas que parezcan equipos
     for col in subset.columns:
         low = str(col).lower()
         if any(k in low for k in ["local", "visit", "equipo", "home", "away", "opponent", "club", "oponente", "team"]):
@@ -490,7 +479,6 @@ def make_jornada_label(df, j):
             if found_team_values:
                 break
 
-    # fallback: buscar patterns en todas las celdas
     if not found_team_values:
         pattern_vs = re.compile(r"\b(.+?)\s+vs\.?\s+(.+)", flags=re.IGNORECASE)
         pattern_score = re.compile(r"\s*([^\d\n]+?)\s+(\d+\s*[-–]\s*\d+)\s+([^\d\n]+)\s*", flags=re.IGNORECASE)
@@ -543,10 +531,8 @@ if j_df.empty:
     st.warning("No hay registros para la jornada seleccionada.")
     st.stop()
 
-# identificar columna jugador (ya renombrada a 'jugador')
 player_col = "jugador"
 
-# obtener fecha_partido y resultado_partido si existen
 fecha_partido = None
 if "fecha_partido" in j_df.columns and not j_df["fecha_partido"].dropna().empty:
     fecha_partido = j_df["fecha_partido"].dropna().iloc[0]
@@ -554,12 +540,12 @@ resultado_partido = None
 if "resultado_partido" in j_df.columns and not j_df["resultado_partido"].dropna().empty:
     resultado_partido = j_df["resultado_partido"].dropna().iloc[0]
 
-# Construir mapa existing por id (basado en ratings_df)
+# Construir mapa existing por id (basado en ratings_df cargado al inicio del run)
 ratings_df_local = ratings_df.copy()
 ratings_df_local["id"] = ratings_df_local.get("id", ratings_df_local.apply(lambda r: make_row_id(r.get("Jornada", ""), r.get("Jugador", ""), r.get("Evaluador", "")), axis=1))
 existing_map = {str(r["id"]): idx for idx, r in ratings_df_local.iterrows()}
 
-# Mostrar alineación & minutos (PRIMERA SECCIÓN: sin mostrar goles/asistencias)
+# Mostrar alineación & minutos (sin goles/asistencias numéricas)
 col1, col2, col3 = st.columns([1, 2, 2])
 with col1:
     st.metric("Jornada", str(selected_jornada))
@@ -582,14 +568,10 @@ with col3:
     for idx, row in display_df.iterrows():
         jugador = str(row[player_col])
         minutos = int(row["minutos"]) if "minutos" in row.index and not pd.isna(row["minutos"]) else None
-        # obtener gol/asistencia solo para decidir si aplicamos negritas; NO se mostrarán los números aquí
         gol = int(row["gol"]) if "gol" in row.index and not pd.isna(row["gol"]) else 0
         asistencia = int(row["asistencia"]) if "asistencia" in row.index and not pd.isna(row["asistencia"]) else 0
 
         name_col, min_col = st.columns([6, 1])
-
-        # Nombre siempre en negrita.
-        # Si gol o asistencia >=1 -> también mostramos minutos en negrita (pero NO mostramos los contadores).
         name_col.markdown(f"**{jugador}**")
         min_text = f"{minutos}'" if minutos is not None else ""
         if gol >= 1 or asistencia >= 1:
@@ -600,7 +582,6 @@ with col3:
 st.markdown("---")
 
 # Promedio de calificaciones ya guardadas por este evaluador en esta jornada
-# Calculamos el promedio a partir de ratings_df_local (cargado al inicio) — se actualizará al hacer rerun tras guardar.
 calificaciones_guardadas = []
 for _, rec in ratings_df_local.iterrows():
     try:
@@ -625,8 +606,14 @@ if "minutos" not in visible_df.columns:
     visible_df["minutos"] = 0
 visible_df = visible_df.sort_values(by="minutos", ascending=False).reset_index(drop=True)
 
-# Preparar ratings_to_write
-ratings_to_write = []
+# Preparamos mapping id -> timestamp tal como existía al cargar el formulario
+initial_timestamps_by_id: Dict[str, str] = {}
+for idx, row in ratings_df_local.iterrows():
+    rid = str(row.get("id", "")).strip()
+    if rid:
+        initial_timestamps_by_id[rid] = str(row.get("timestamp", "") or "")
+
+ratings_to_write: List[dict] = []
 
 with st.form("ratings_form_improved"):
     for local_idx, row in visible_df.iterrows():
@@ -639,7 +626,6 @@ with st.form("ratings_form_improved"):
         rid = make_row_id(*key)
         default_val = 6.0
         if rid in existing_map:
-            # intentar obtener calificación existente
             try:
                 existing_row = ratings_df_local.loc[int(existing_map[rid])]
                 if existing_row.get("Calificacion", "") != "":
@@ -651,7 +637,6 @@ with st.form("ratings_form_improved"):
         with a_col:
             min_display = f"{minutos}'" if minutos is not None else "—"
             info_rest = f"_min: {min_display}_  \nGol: {gol}  •  Ast: {asistencia}"
-            # Nombre siempre en negrita; en el formulario mostramos Gol/Asistencia para referencia
             if gol >= 1 or asistencia >= 1:
                 st.markdown(f"**{jugador}  \n{info_rest}**")
             else:
@@ -679,9 +664,8 @@ with st.form("ratings_form_improved"):
 
     submitted = st.form_submit_button("Guardar calificaciones")
 
-# Guardado (append/update por id)
+# Guardado (append/update por id) con writes condicionales y batch_update
 if submitted:
-    # Prevención doble-submit: solo permitir 1 submit por jornada por sesión
     if st.session_state.get("submitted_jornada") == selected_jornada:
         st.warning("Ya enviaste calificaciones para esta jornada en esta sesión. Evita envíos duplicados.")
     else:
@@ -690,20 +674,23 @@ if submitted:
                 # refrescar ratings_df actual (sin usar cache) para evitar usar datos stale
                 current_records = safe_get_all_records(ratings_ws)
                 current_df = pd.DataFrame(current_records) if current_records else pd.DataFrame()
-                # crear map id->row_number (1-based incl header)
                 id_to_rownum = {}
                 if not current_df.empty:
-                    # get_all_records lo devuelve sin indices, la fila 1 es header => rownum = idx+2
                     for idx, r in current_df.iterrows():
                         rid = str(r.get("id", "")).strip()
                         if rid:
-                            id_to_rownum[rid] = idx + 2
+                            id_to_rownum[rid] = idx + 2  # header row 1
 
-                # preparar filas nuevas para append y filas a actualizar
-                rows_to_append = []
-                rows_to_update = []
+                # preparar filas nuevas para append y filas a actualizar SOLO si hay cambios
+                rows_to_append: List[List] = []
+                batch_updates: List[Dict] = []
+                skipped_due_to_collision: List[str] = []
+                updated_count = 0
+                appended_count = 0
+
+                # Collisions: si current_df tiene timestamp distinto al timestamp que había cuando cargamos el formulario
+                # initial_timestamps_by_id almacenó timestamps al cargar el formulario.
                 for r in ratings_to_write:
-                    # normalizar y validar mínimamente antes de escribir
                     r_clean = normalize_and_validate_record(r)
                     rid = r_clean["id"]
                     row_values = [
@@ -720,35 +707,86 @@ if submitted:
                         r_clean["timestamp"],
                     ]
                     if rid in id_to_rownum:
-                        # update that row
-                        rownum = id_to_rownum[rid]
-                        rows_to_update.append((rownum, row_values))
+                        # obtener existing row de current_df para comparar
+                        try:
+                            existing_idx = id_to_rownum[rid] - 2  # back to 0-based records idx
+                            existing_row = current_df.iloc[existing_idx]
+                            # collision detection: si existing_row.timestamp != initial timestamp at form load, otra sesión modificó
+                            existing_ts = str(existing_row.get("timestamp", "") or "")
+                            initial_ts = initial_timestamps_by_id.get(rid, "")
+                            if initial_ts and existing_ts and existing_ts != initial_ts:
+                                skipped_due_to_collision.append(r_clean["Jugador"])
+                                logger.info(f"Salteando actualización por colisión (id={rid}, jugador={r_clean['Jugador']}). initial_ts={initial_ts}, existing_ts={existing_ts}")
+                                continue  # no sobrescribimos
+                            # comparar celda a celda (como strings) para decidir si update necesario
+                            existing_values = [
+                                str(existing_row.get(col, "") if not pd.isna(existing_row.get(col, "")) else "")
+                                for col in EXPECTED_RATINGS_HEADERS
+                            ]
+                            new_values = [str(v) if v is not None else "" for v in row_values]
+                            # only update if content differs
+                            if existing_values != new_values:
+                                rownum = id_to_rownum[rid]
+                                last_col_letter = chr(ord("A") + len(row_values) - 1)
+                                rng = f"A{rownum}:{last_col_letter}{rownum}"
+                                batch_updates.append({"range": rng, "values": [row_values]})
+                                updated_count += 1
+                            else:
+                                logger.debug(f"No hay cambios para id={rid}, jugador={r_clean['Jugador']}. Omitiendo update.")
+                        except Exception:
+                            # fallback: hacer update por seguridad
+                            rownum = id_to_rownum.get(rid)
+                            if rownum:
+                                last_col_letter = chr(ord("A") + len(row_values) - 1)
+                                rng = f"A{rownum}:{last_col_letter}{rownum}"
+                                batch_updates.append({"range": rng, "values": [row_values]})
+                                updated_count += 1
                     else:
                         rows_to_append.append(row_values)
+                        appended_count += 1
 
-                # Ejecutar actualizaciones
-                # 1) updates
-                for rownum, values in rows_to_update:
+                # Ejecutar actualizaciones en batch (siempre que haya algo)
+                if batch_updates:
                     try:
-                        update_row(ratings_ws, rownum, values)
+                        batch_update_rows(ratings_ws.spreadsheet, batch_updates)
                     except Exception:
-                        logger.exception(f"Error actualizando fila {rownum} (id: {values[0]})")
+                        logger.exception("Error realizando batch updates; intentando updates individuales como fallback")
+                        # fallback: intentar individualmente
+                        for upd in batch_updates:
+                            rng = upd["range"]
+                            vals = upd["values"]
+                            try:
+                                retry_with_backoff(lambda: ratings_ws.update(rng, vals, value_input_option="USER_ENTERED"))
+                            except Exception:
+                                logger.exception(f"Error actualizando rango {rng} (fallback).")
 
-                # 2) appends (batch)
+                # Appends (batch)
                 if rows_to_append:
-                    append_rows(ratings_ws, rows_to_append)
+                    try:
+                        append_rows(ratings_ws, rows_to_append)
+                    except Exception:
+                        logger.exception("Error haciendo append_rows")
 
                 # marcar sesión y notificar
                 st.session_state["submitted_jornada"] = selected_jornada
-                st.success(f"Guardadas/actualizadas {len(ratings_to_write)} calificaciones en Google Sheets.")
+                msg = f"Guardadas/actualizadas: {updated_count} actualizaciones, {appended_count} nuevas."
+                if skipped_due_to_collision:
+                    msg += f" {len(skipped_due_to_collision)} filas saltadas por colisión: {', '.join(skipped_due_to_collision)}."
+                    st.warning(f"Se saltaron {len(skipped_due_to_collision)} filas porque fueron modificadas por otra sesión (ver detalles).")
+                st.success(msg)
+                logger.info(msg)
 
-                # Re-lectura inmediata para mostrar resultados y FORZAR recalculo de promedios:
+                # invalidar caches relevantes y re-lectura inmediata para mostrar resultados
+                _session_cache_invalidate("ratings::")
                 try:
                     refreshed = safe_get_all_records(ratings_ws)
                     ratings_df = pd.DataFrame(refreshed) if refreshed else pd.DataFrame()
+                    # guardar última sincronización
+                    st.session_state["last_sync_ratings"] = now_utc_iso()
                 except Exception:
                     logger.exception("No se pudo refrescar calificaciones tras guardado.")
-                # Fuerza rerun para que el bloque que calcula el promedio use los datos actualizados.
+
+                # Forzar rerun para recalcular UI como antes (mantengo rerun para comportamientos existentes)
                 st.experimental_rerun()
 
         except Exception:
@@ -761,14 +799,11 @@ if submitted:
 st.markdown("---")
 st.subheader("Descargar calificaciones")
 
-# Cargar todas las calificaciones y filtrar por evaluador actual
 try:
     all_records = safe_get_all_records(ratings_ws)
     all_df = pd.DataFrame(all_records) if all_records else pd.DataFrame(columns=EXPECTED_RATINGS_HEADERS)
-    # normalizar columna Evaluador si falta
     if "Evaluador" not in all_df.columns:
         all_df["Evaluador"] = None
-    # filtrar por evaluador (trim y case-sensitive as original)
     df_user = all_df[all_df["Evaluador"].astype(str).str.strip() == str(evaluador).strip()].copy()
 except Exception:
     logger.exception("Error leyendo todas las calificaciones para descarga")
@@ -776,7 +811,6 @@ except Exception:
 
 if df_user.empty:
     st.info("No se encontraron calificaciones guardadas por este evaluador.")
-    # mostrar botón disabled para mantener consistencia visual (si tu versión de Streamlit lo soporta)
     try:
         st.download_button(
             "Descargar todas mis calificaciones (evaluador)",
@@ -786,10 +820,10 @@ if df_user.empty:
             disabled=True,
         )
     except TypeError:
-        # fallback: solo mostrar info si la versión no soporta disabled
         pass
 else:
-    csv = df_user.to_csv(index=False).encode("utf-8")
+    # UTF-8 BOM para compatibilidad con Excel
+    csv = df_user.to_csv(index=False, encoding="utf-8-sig", line_terminator="\n").encode("utf-8-sig")
     st.download_button(
         "Descargar todas mis calificaciones (evaluador)",
         data=csv,
@@ -797,5 +831,10 @@ else:
         mime="text/csv",
     )
 
-# Fin del archivo
+# Mostrar info de última sincronización
+st.markdown("---")
+last_align = st.session_state.get("last_sync_alignments", "N/A")
+last_ratings = st.session_state.get("last_sync_ratings", "N/A")
+st.info(f"Última sync - Alineaciones: {last_align}  |  Calificaciones: {last_ratings}")
 
+# Fin del archivo
