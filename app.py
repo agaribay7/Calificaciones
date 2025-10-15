@@ -1039,11 +1039,12 @@ else:
 
     csv_bytes = csv_str.encode("utf-8-sig")
     st.download_button(
-        "Descargar todas mis calificaciones (evaluador)",
+        "Descargar todas mis calificaciones",
         data=csv_bytes,
         file_name=f"calificaciones_{safe_key(evaluador)}.csv",
         mime="text/csv",
     )
 
 # Fin del archivo
+
 
