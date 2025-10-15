@@ -2,14 +2,12 @@
 """
 Streamlit app — Calificar Alineaciones — Google Sheets
 Versión: mejoras de seguridad y robustez (sin cambiar funcionalidad).
-- No se expone información de credenciales en UI.
-- Cliente gspread cacheado (st.cache_resource) con hash_funcs para Credentials.
-- Lecturas de gspread con retry/backoff centralizado (safe_get_all_records).
-- Validaciones mínimas antes de escribir.
-- Spinner durante guardado.
+Cambios recientes:
+- Primera sección: no se muestran goles/asistencias (solo nombre y minutos).
 - Correcciones: manejo seguro de pd.NA y comportamiento de negritas por gol/asistencia.
-- En la PRIMERA SECCIÓN (alineación) no se muestran goles ni asistencias (solo nombre y minutos).
 - Tras guardar, se fuerza rerun para recalcular promedios inmediatamente.
+- Al final: en lugar de mostrar tabla por jornada, hay UN SOLO botón que descarga
+  todas las calificaciones del evaluador (sin mostrar tabla).
 Mantiene la lógica original: ids, append/update por id, formularios, etc.
 """
 
@@ -757,38 +755,46 @@ if submitted:
             logger.exception("Error procesando guardado por lote")
             st.error("Ocurrió un error al guardar. Revisa logs.")
 
-# Mostrar calificaciones guardadas (filtrado por jornada y evaluador)
-st.subheader("Calificaciones guardadas (esta jornada)")
-rows_show = []
-# recargar actual (para asegurarnos)
-try:
-    current_records = safe_get_all_records(ratings_ws)
-    current_df = pd.DataFrame(current_records) if current_records else pd.DataFrame()
-    if not current_df.empty:
-        for idx, rec in current_df.iterrows():
-            if str(rec.get("Jornada")) == str(selected_jornada) and str(rec.get("Evaluador", "")).strip() == str(evaluador).strip():
-                rows_show.append(
-                    {
-                        "Jornada": rec.get("Jornada"),
-                        "Jugador": rec.get("Jugador"),
-                        "Evaluador": rec.get("Evaluador"),
-                        "Calificacion": rec.get("Calificacion"),
-                        "Minutos": rec.get("Minutos"),
-                        "Gol": rec.get("Gol"),
-                        "Asistencia": rec.get("Asistencia"),
-                        "Resultado": rec.get("Resultado"),
-                        "Fecha Partido": rec.get("Fecha Partido"),
-                        "timestamp": rec.get("timestamp"),
-                    }
-                )
-except Exception:
-    logger.exception("Error al leer calificaciones para mostrar")
+# ======================
+# Descarga: todas las calificaciones del evaluador (SIN mostrar tabla)
+# ======================
+st.markdown("---")
+st.subheader("Descargar calificaciones")
 
-if rows_show:
-    df_display = pd.DataFrame(rows_show).sort_values(by="Calificacion", ascending=False)
-    st.dataframe(df_display.reset_index(drop=True))
-    # boton para descargar CSV
-    csv = df_display.to_csv(index=False).encode("utf-8")
-    st.download_button("Descargar CSV de mis calificaciones (jornada)", data=csv, file_name=f"calificaciones_j{selected_jornada}.csv", mime="text/csv")
+# Cargar todas las calificaciones y filtrar por evaluador actual
+try:
+    all_records = safe_get_all_records(ratings_ws)
+    all_df = pd.DataFrame(all_records) if all_records else pd.DataFrame(columns=EXPECTED_RATINGS_HEADERS)
+    # normalizar columna Evaluador si falta
+    if "Evaluador" not in all_df.columns:
+        all_df["Evaluador"] = None
+    # filtrar por evaluador (trim y case-sensitive as original)
+    df_user = all_df[all_df["Evaluador"].astype(str).str.strip() == str(evaluador).strip()].copy()
+except Exception:
+    logger.exception("Error leyendo todas las calificaciones para descarga")
+    df_user = pd.DataFrame(columns=EXPECTED_RATINGS_HEADERS)
+
+if df_user.empty:
+    st.info("No se encontraron calificaciones guardadas por este evaluador.")
+    # mostrar botón disabled para mantener consistencia visual (si tu versión de Streamlit lo soporta)
+    try:
+        st.download_button(
+            "Descargar todas mis calificaciones (evaluador)",
+            data="",
+            file_name=f"calificaciones_{safe_key(evaluador)}.csv",
+            mime="text/csv",
+            disabled=True,
+        )
+    except TypeError:
+        # fallback: solo mostrar info si la versión no soporta disabled
+        pass
 else:
-    st.info("No hay calificaciones guardadas por este evaluador para esta jornada.")
+    csv = df_user.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "Descargar todas mis calificaciones (evaluador)",
+        data=csv,
+        file_name=f"calificaciones_{safe_key(evaluador)}.csv",
+        mime="text/csv",
+    )
+
+# Fin del archivo
