@@ -861,12 +861,18 @@ if submitted:
                     ratings_df = pd.DataFrame(refreshed) if refreshed else pd.DataFrame()
                 except Exception:
                     logger.exception("No se pudo refrescar calificaciones tras guardado.")
-
-                st.experimental_rerun()
+                saved_ok = True
 
         except Exception:
             logger.exception("Error procesando guardado por lote")
             st.error("Ocurrió un error al guardar. Revisa logs.")
+
+        # Si el guardado fue exitoso, hacemos rerun FUERA del bloque try/except
+        # para evitar capturar la excepción interna de Streamlit que provoca el
+        # mensaje de error visible. Esto asegura que el flujo normal de rerun
+        # ocurra sin que nuestro except lo interprete como fallo.
+        if 'saved_ok' in locals() and saved_ok:
+            st.experimental_rerun()
 
 # ======================
 # Descarga: todas las calificaciones del evaluador (SIN mostrar tabla)
