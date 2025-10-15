@@ -1,9 +1,9 @@
 # app.py
 """
 Streamlit app — Calificar Alineaciones — Google Sheets
-Versión: mejoras de seguridad y robustez (batch updates, writes condicionales,
-detección de colisiones, cache ligera, validación de headers, etc.)
-Se dejó el selector en la barra lateral y se inyectó CSS para aumentar su ancho.
+Versión: ajuste automático del ancho de la barra lateral para que el selector
+de evaluador quepa por defecto (sin que el usuario tenga que redimensionar).
+Mantiene la lógica funcional original (ids, append/update por id, formularios).
 """
 
 import base64
@@ -33,40 +33,6 @@ if not logger.handlers:
     ch = logging.StreamHandler()
     ch.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
     logger.addHandler(ch)
-
-# -------- CSS: expandir ancho de la sidebar y desplegables --------
-# Ajusta el valor de 360px si quieres más/menos ancho.
-SIDEBAR_WIDTH_PX = 360
-st.markdown(
-    f"""
-    <style>
-    /* Target common sidebar containers (covers multiple Streamlit versions) */
-    [data-testid="stSidebar"] > div:first-child {{
-        min-width: {SIDEBAR_WIDTH_PX}px;
-        width: {SIDEBAR_WIDTH_PX}px;
-    }}
-    /* Fallback selectors used by some Streamlit builds */
-    .css-1d391kg, .css-1v3fvcr, .css-1lsmgbg {{
-        min-width: {SIDEBAR_WIDTH_PX}px !important;
-        width: {SIDEBAR_WIDTH_PX}px !important;
-    }}
-    /* Expand the listbox (dropdown options panel) */
-    div[role="listbox"] {{
-        min-width: {max(280, SIDEBAR_WIDTH_PX - 40)}px !important;
-        width: {max(280, SIDEBAR_WIDTH_PX - 40)}px !important;
-    }}
-    /* Allow selectbox label / content to wrap instead of truncating */
-    .stSelectbox div[role="button"], .stSelectbox .css-1tq9d2s {{
-        white-space: normal !important;
-    }}
-    /* Ensure sidebar widgets don't overflow horizontally */
-    [data-testid="stSidebar"] .stSelectbox, [data-testid="stSidebar"] .stTextInput {{
-        width: 100% !important;
-    }}
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
 
 # -------- CONSTANTS / CONFIG --------
 SHEET_URL = "https://docs.google.com/spreadsheets/d/1OQRTq818EXBeibBmWlrcSZm83do264l2mb5jnBmzsu8"
@@ -405,7 +371,7 @@ st.session_state.setdefault("evaluador", "")
 st.session_state.setdefault("pending_new_eval", "")
 st.session_state.setdefault("submitted_jornada", None)
 
-# Sidebar: evaluador list / create UI (selector ahora en sidebar, ampliado por CSS)
+# Sidebar: evaluador list / create UI (selector en sidebar)
 existing_evaluadores = sorted({str(r).strip() for r in ratings_df["Evaluador"].dropna().unique()}) if not ratings_df.empty else []
 create_option = "— Crear nuevo evaluador —"
 placeholder_option = "— Selecciona evaluador —"
@@ -423,7 +389,60 @@ default_index = 0
 if default_value in eval_options:
     default_index = eval_options.index(default_value)
 
-# -- Selector en la barra lateral (ahora más ancho gracias al CSS inyectado arriba) --
+# --------------------------
+# Aquí inyectamos CSS dinámico según el contenido de eval_options
+# --------------------------
+# Estimación simple del ancho necesario en px:
+# - asumimos ~8px por carácter (promedio), y añadimos padding extra.
+# - ponemos límites min/max para no romper el layout.
+max_label_len = 0
+try:
+    max_label_len = max(len(str(o)) for o in eval_options) if eval_options else 30
+except Exception:
+    max_label_len = 30
+
+# parámetros de control (ajusta si quieres)
+CHAR_WIDTH_PX = 8
+HORIZONTAL_PADDING_PX = 120  # espacio adicional para padding / iconos / scrollbar
+MIN_SIDEBAR_PX = 300
+MAX_SIDEBAR_PX = 900
+
+computed_width = max(MIN_SIDEBAR_PX, min(MAX_SIDEBAR_PX, max_label_len * CHAR_WIDTH_PX + HORIZONTAL_PADDING_PX))
+listbox_min_width = max(280, computed_width - 40)
+
+# Inyectar CSS usando el ancho calculado
+st.markdown(
+    f"""
+    <style>
+    /* Target common sidebar container */
+    [data-testid="stSidebar"] > div:first-child {{
+        min-width: {computed_width}px;
+        width: {computed_width}px;
+    }}
+    /* Fallback selectors used by some Streamlit builds */
+    .css-1d391kg, .css-1v3fvcr, .css-1lsmgbg {{
+        min-width: {computed_width}px !important;
+        width: {computed_width}px !important;
+    }}
+    /* Expand the listbox (dropdown options panel) */
+    div[role="listbox"] {{
+        min-width: {listbox_min_width}px !important;
+        width: {listbox_min_width}px !important;
+    }}
+    /* Allow selectbox label / content to wrap instead of truncating */
+    .stSelectbox div[role="button"], .stSelectbox .css-1tq9d2s {{
+        white-space: normal !important;
+    }}
+    /* Ensure sidebar widgets don't overflow horizontally */
+    [data-testid="stSidebar"] .stSelectbox, [data-testid="stSidebar"] .stTextInput {{
+        width: 100% !important;
+    }}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+# -- Selector en la barra lateral (debería caber por defecto ahora) --
 selected_eval = st.sidebar.selectbox("Elige tu evaluador", eval_options, index=default_index, key="eval_selectbox")
 
 if selected_eval == placeholder_option:
