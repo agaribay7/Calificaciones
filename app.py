@@ -995,7 +995,7 @@ if df_user.empty:
     st.info("No se encontraron calificaciones guardadas por este evaluador.")
     try:
         st.download_button(
-            "Descargar todas mis calificaciones (evaluador)",
+            "Descargar todas mis calificaciones",
             data="",
             file_name=f"calificaciones_{safe_key(evaluador)}.csv",
             mime="text/csv",
@@ -1046,3 +1046,4 @@ else:
     )
 
 # Fin del archivo
+
