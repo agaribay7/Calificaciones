@@ -6,6 +6,7 @@ de evaluador quepa por defecto (sin que el usuario tenga que redimensionar).
 Mejoras: normalización de ids, lectura mínima A2:K para index, batching, prevención de duplicados,
 descarga sin id/timestamp y Fecha Partido sin hora.
 Correcciones: persistencia del selectbox al hacer submit con Enter y permitir editar jornadas ya enviadas.
+Optimización: prefetch de A2:K para acelerar comparaciones y CHUNK aumentado.
 """
 
 import base64
@@ -657,8 +658,8 @@ def make_jornada_label(df, j):
 unique_jornadas = list(pd.unique(df_align["jornada"].dropna().values))
 jornada_labels = [make_jornada_label(df_align, j) for j in unique_jornadas]
 label_to_jornada = {lab: j for lab, j in zip(jornada_labels, unique_jornadas)}
-selected_label = st.selectbox("Selecciona jornada", jornada_labels)
-selected_jornada = label_to_jornada[selected_label]
+selected_label = st.selectbox("Selecciona jornada", jornada_labels, key="jornada_select")
+selected_jornada = label_to_jornada[st.session_state["jornada_select"]]
 
 j_df = df_align[df_align["jornada"] == selected_jornada].copy()
 if j_df.empty:
@@ -809,8 +810,20 @@ if submitted:
         saved_ok = False
         try:
             with st.spinner("Guardando calificaciones..."):
+                t0_save = time.perf_counter()
+
                 # Leemos solo ids y timestamps para comprobar colisiones y para construir id->rownum
                 id_to_rownum, id_to_ts = read_ratings_index(ratings_ws)
+
+                # PREFETCH: leer A2:K UNA sola vez para evitar row_values por fila
+                try:
+                    existing_rows_raw = retry_with_backoff(lambda: ratings_ws.get("A2:K"))
+                except Exception:
+                    existing_rows_raw = []
+                # construir mapa rownum -> valores (listas de strings)
+                rownum_to_values = {}
+                for i, row in enumerate(existing_rows_raw, start=2):
+                    rownum_to_values[i] = [str(x) for x in row]
 
                 rows_to_append: List[List] = []
                 batch_updates: List[Dict] = []
@@ -844,14 +857,17 @@ if submitted:
                             if initial_ts and existing_ts and existing_ts != initial_ts:
                                 logger.info(f"Colisión detectada pero se procederá a sobrescribir (id={rid}, jugador={r_clean['Jugador']}). initial_ts={initial_ts}, existing_ts={existing_ts}")
 
-                            # Leemos la fila existente para comparar (lectura puntual)
-                            try:
-                                existing_row_values = retry_with_backoff(lambda: ratings_ws.row_values(rownum))
-                            except Exception:
-                                existing_row_values = []
+                            # Obtener la fila existente desde el prefetch (si está disponible)
+                            existing_row_values = rownum_to_values.get(rownum)
+                            if existing_row_values is None:
+                                # fallback puntual: leer la fila si no estaba en el prefetch
+                                try:
+                                    existing_row_values = retry_with_backoff(lambda: ratings_ws.row_values(rownum))
+                                except Exception:
+                                    existing_row_values = []
 
                             # Alinear longitud
-                            existing_values = [str(existing_row_values[i]) if i < len(existing_row_values) else "" for i in range(len(row_values))]
+                            existing_values = [existing_row_values[i] if i < len(existing_row_values) else "" for i in range(len(row_values))]
                             new_values = [str(v) if v is not None else "" for v in row_values]
 
                             if existing_values != new_values:
@@ -872,10 +888,14 @@ if submitted:
                         rows_to_append.append(row_values)
                         appended_count += 1
 
-                # Ejecutar updates
+                # Ejecutar updates (en batches)
                 if batch_updates:
                     try:
-                        batch_update_rows(ratings_ws.spreadsheet, batch_updates)
+                        # Enviar en chunks razonables para evitar batches enormes
+                        BATCH_CHUNK = 150
+                        for i in range(0, len(batch_updates), BATCH_CHUNK):
+                            sub = batch_updates[i : i + BATCH_CHUNK]
+                            batch_update_rows(ratings_ws.spreadsheet, sub)
                     except Exception:
                         logger.exception("Error realizando batch updates; intentando updates individuales como fallback")
                         for upd in batch_updates:
@@ -889,19 +909,33 @@ if submitted:
                 # Ejecutar appends en batches para robustez y evitar timeouts
                 if rows_to_append:
                     try:
-                        # chunk size configurable
-                        CHUNK = 200
+                        # chunk size configurable (aumentado para menos llamadas)
+                        CHUNK = 500  # <> Cambio: aumentar CHUNK reduce número de append calls
+                        # Nota: si hay concurrencia alta, bajar CHUNK reduce ventana de duplicados.
+                        existing_len = len(existing_rows_raw)  # número de filas ya existentes sin cabecera (A2 es fila 2)
                         for i in range(0, len(rows_to_append), CHUNK):
                             chunk = rows_to_append[i : i + CHUNK]
                             append_rows(ratings_ws, chunk)
-                            # Tras cada append chunk refrescamos el índice para evitar que
-                            # el mismo run termine creando duplicados
-                            id_to_rownum, id_to_ts = read_ratings_index(ratings_ws)
+                            appended_count = appended_count  # solo para consistencia del contador
+
+                            # Actualizar id_to_rownum localmente para minimizar re-lecturas costosas.
+                            # Calculamos rownums asignados a las filas que acabamos de agregar.
+                            # Nota: esto asume append_rows coloca las filas al final consecutivamente.
+                            for j, new_row in enumerate(chunk):
+                                new_rownum = existing_len + 2 + i + j  # +2 porque A2 es la fila 2
+                                new_rid = str(new_row[0])
+                                id_to_rownum[new_rid] = new_rownum
+                                id_to_ts[new_rid] = new_row[10] if len(new_row) > 10 else ""
+                                # también mantener el mapa de rownum_to_values para posibles comparaciones futuras
+                                rownum_to_values[new_rownum] = [str(x) for x in new_row]
+                            # incrementar existing_len para el siguiente chunk
+                            existing_len += len(chunk)
                     except Exception:
                         logger.exception("Error haciendo append_rows")
 
                 st.session_state["submitted_jornada"] = selected_jornada
-                msg = f"Guardadas/actualizadas: {updated_count} actualizaciones, {appended_count} nuevas."
+                elapsed = time.perf_counter() - t0_save
+                msg = f"Guardadas/actualizadas: {updated_count} actualizaciones, {appended_count} nuevas. (guardado en {elapsed:.2f}s)"
                 if skipped_due_to_collision:
                     msg += f" {len(skipped_due_to_collision)} filas saltadas por colisión: {', '.join(skipped_due_to_collision)}."
                     st.warning(f"Se saltaron {len(skipped_due_to_collision)} filas porque fueron modificadas por otra sesión (ver detalles).")
