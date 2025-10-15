@@ -4,7 +4,7 @@ Streamlit app — Calificar Alineaciones — Google Sheets
 Versión: mejoras de seguridad y robustez (batch updates, writes condicionales,
 detección de colisiones, cache ligera, validación de headers, etc.)
 Mantiene la lógica funcional original (ids, append/update por id, formularios).
-Se eliminó la visualización/registro de 'última sync' por petición.
+Selector de evaluador movido al área principal (más ancho) para mejor visibilidad.
 """
 
 import base64
@@ -389,7 +389,7 @@ st.session_state.setdefault("evaluador", "")
 st.session_state.setdefault("pending_new_eval", "")
 st.session_state.setdefault("submitted_jornada", None)
 
-# Sidebar: evaluador
+# Sidebar: evaluador list / create UI (we keep creation controls in sidebar)
 existing_evaluadores = sorted({str(r).strip() for r in ratings_df["Evaluador"].dropna().unique()}) if not ratings_df.empty else []
 create_option = "— Crear nuevo evaluador —"
 placeholder_option = "— Selecciona evaluador —"
@@ -407,14 +407,20 @@ default_index = 0
 if default_value in eval_options:
     default_index = eval_options.index(default_value)
 
-selected_eval = st.sidebar.selectbox("Elige tu evaluador", eval_options, index=default_index, key="eval_selectbox")
+# --- Opción A: mover el selectbox al área principal (más ancho) ---
+# Lo colocamos en la parte superior utilizando columnas para dar más espacio.
+col_top, _ = st.columns([3, 1])
+with col_top:
+    selected_eval = st.selectbox("Elige tu evaluador", eval_options, index=default_index, key="eval_selectbox")
 
+# Mantener creación en sidebar: si selecciona "Crear nuevo evaluador", el input/botón están en la sidebar.
 if selected_eval == placeholder_option:
-    st.sidebar.info("Por favor selecciona o crea un evaluador para habilitar la app.")
-    st.warning("La app está inactiva hasta que selecciones o crees un evaluador en la barra lateral.")
+    st.info("Por favor selecciona o crea un evaluador para habilitar la app.")
+    st.warning("La app está inactiva hasta que selecciones o crees un evaluador.")
     st.stop()
 
 if selected_eval == create_option:
+    # input y botón en la sidebar (para no ocupar espacio principal)
     new_eval = st.sidebar.text_input("Nuevo nombre de evaluador", value="", key="new_eval_input")
     create_pressed = st.sidebar.button("Crear y usar este nombre", key="create_eval_btn")
     st.sidebar.info("Escribe un nombre y pulsa 'Crear y usar este nombre' para habilitar la app.")
