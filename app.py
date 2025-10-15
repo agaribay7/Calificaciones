@@ -822,11 +822,12 @@ if df_user.empty:
     except TypeError:
         pass
 else:
-    # UTF-8 BOM para compatibilidad con Excel
-    csv = df_user.to_csv(index=False, encoding="utf-8-sig", line_terminator="\n").encode("utf-8-sig")
+    # Generar cadena CSV primero (sin pasar `encoding` a to_csv), luego codificar a bytes con BOM
+    csv_str = df_user.to_csv(index=False, line_terminator="\n")
+    csv_bytes = csv_str.encode("utf-8-sig")  # BOM para compatibilidad Excel
     st.download_button(
         "Descargar todas mis calificaciones (evaluador)",
-        data=csv,
+        data=csv_bytes,
         file_name=f"calificaciones_{safe_key(evaluador)}.csv",
         mime="text/csv",
     )
