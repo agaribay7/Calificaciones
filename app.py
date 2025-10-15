@@ -872,7 +872,20 @@ if submitted:
         # mensaje de error visible. Esto asegura que el flujo normal de rerun
         # ocurra sin que nuestro except lo interprete como fallo.
         if 'saved_ok' in locals() and saved_ok:
-            st.experimental_rerun()
+            # Forzar rerun sin usar st.experimental_rerun() directo en todas las versiones de Streamlit,
+            # porque en algunas builds esa llamada puede propagar excepciones internas (AttributeError)
+            # que rompen la app. En su lugar ajustamos un query param que provoca un rerun seguro.
+            try:
+                params = st.experimental_get_query_params()
+                params['_ts'] = [str(time.time())]
+                st.experimental_set_query_params(**params)
+            except Exception:
+                logger.exception('No se pudo forzar rerun vía query params; intentando st.experimental_rerun() como fallback')
+                try:
+                    st.experimental_rerun()
+                except Exception:
+                    # Si incluso el fallback falla, registramos y continuamos; el guardado ya fue hecho.
+                    logger.exception('st.experimental_rerun() lanzó excepción en el fallback (se ignora).')
 
 # ======================
 # Descarga: todas las calificaciones del evaluador (SIN mostrar tabla)
