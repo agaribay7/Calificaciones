@@ -7,6 +7,8 @@ Versión: mejoras de seguridad y robustez (sin cambiar funcionalidad).
 - Lecturas de gspread con retry/backoff centralizado (safe_get_all_records).
 - Validaciones mínimas antes de escribir.
 - Spinner durante guardado.
+- Correcciones: manejo seguro de pd.NA y comportamiento de negritas por gol/asistencia.
+- Mejora: tras guardar correctamente se fuerza rerun para recalcular promedios inmediatamente.
 Mantiene la lógica original: ids, append/update por id, formularios, etc.
 """
 
@@ -585,16 +587,25 @@ with col3:
         asistencia = int(row["asistencia"]) if "asistencia" in row.index and not pd.isna(row["asistencia"]) else 0
 
         name_col, min_col = st.columns([6, 1])
-        name_col.markdown(f"**{jugador}**")
+
+        # Construir bloque de info
         min_text = f"{minutos}'" if minutos is not None else ""
+        info_rest = f"_min: {min_text}_  \nGol: {gol}  •  Ast: {asistencia}"
+
+        # Nombre siempre en negrita; si gol o asistencia -> toda la info en negrita
         if gol >= 1 or asistencia >= 1:
+            # jugador + info todo en negritas
+            name_col.markdown(f"**{jugador}  \n{info_rest}**")
             min_col.markdown(f"**{min_text}**")
         else:
+            # solo nombre en negrita, resto normal (pero con estilo ligero)
+            name_col.markdown(f"**{jugador}**  \n{info_rest}")
             min_col.write(min_text)
 
 st.markdown("---")
 
 # Promedio de calificaciones ya guardadas por este evaluador en esta jornada
+# Calculamos el promedio a partir de ratings_df_local (cargado al inicio) — se actualizará al hacer rerun tras guardar.
 calificaciones_guardadas = []
 for _, rec in ratings_df_local.iterrows():
     try:
@@ -644,8 +655,12 @@ with st.form("ratings_form_improved"):
         a_col, b_col, c_col = st.columns([6, 2, 1])
         with a_col:
             min_display = f"{minutos}'" if minutos is not None else "—"
-            block = f"{jugador}  \n_min: {min_display}_  \nGol: {gol}  •  Ast: {asistencia}"
-            st.markdown(f"**{block}**")
+            info_rest = f"_min: {min_display}_  \nGol: {gol}  •  Ast: {asistencia}"
+            # Nombre siempre en negrita; si gol o asistencia -> toda la info en negrita
+            if gol >= 1 or asistencia >= 1:
+                st.markdown(f"**{jugador}  \n{info_rest}**")
+            else:
+                st.markdown(f"**{jugador}**  \n{info_rest}")
         with b_col:
             cal_key = f"cal_{safe_key(selected_jornada)}_{local_idx}_{safe_key(evaluador)}"
             cal_val = st.number_input("", min_value=0.0, max_value=10.0, value=float(default_val), step=0.5, key=cal_key, label_visibility="collapsed")
@@ -728,14 +743,20 @@ if submitted:
                 if rows_to_append:
                     append_rows(ratings_ws, rows_to_append)
 
-                st.success(f"Guardadas/actualizadas {len(ratings_to_write)} calificaciones en Google Sheets.")
+                # marcar sesión y notificar
                 st.session_state["submitted_jornada"] = selected_jornada
+                st.success(f"Guardadas/actualizadas {len(ratings_to_write)} calificaciones en Google Sheets.")
 
-                # Re-lectura inmediata para mostrar resultados
-                refreshed = safe_get_all_records(ratings_ws)
-                ratings_df_local = pd.DataFrame(refreshed) if refreshed else pd.DataFrame()
-                ratings_df_local["id"] = ratings_df_local.get("id", ratings_df_local.apply(lambda r: make_row_id(r.get("Jornada", ""), r.get("Jugador", ""), r.get("Evaluador", "")), axis=1))
-                existing_map = {str(r["id"]): idx for idx, r in ratings_df_local.iterrows()}
+                # Re-lectura inmediata para mostrar resultados y FORZAR recalculo de promedios:
+                # Actualizamos ratings_df en memoria y hacemos un rerun completo para que la UI superior se recalcule.
+                try:
+                    refreshed = safe_get_all_records(ratings_ws)
+                    # opcional: actualizar variable global local
+                    ratings_df = pd.DataFrame(refreshed) if refreshed else pd.DataFrame()
+                except Exception:
+                    logger.exception("No se pudo refrescar calificaciones tras guardado.")
+                # Fuerza rerun para que el bloque que calcula el promedio use los datos actualizados.
+                st.experimental_rerun()
 
         except Exception:
             logger.exception("Error procesando guardado por lote")
