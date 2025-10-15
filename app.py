@@ -822,9 +822,31 @@ if df_user.empty:
     except TypeError:
         pass
 else:
-    # Generar cadena CSV primero (sin pasar `encoding` a to_csv), luego codificar a bytes con BOM
-    csv_str = df_user.to_csv(index=False, line_terminator="\n")
-    csv_bytes = csv_str.encode("utf-8-sig")  # BOM para compatibilidad Excel
+    # Generación robusta de CSV: primero intentamos to_csv simple; si falla, usamos csv.DictWriter como fallback.
+    try:
+        csv_str = df_user.to_csv(index=False)
+    except TypeError:
+        # fallback manual por compatibilidad con versiones antiguas de pandas
+        try:
+            import csv
+
+            buf = io.StringIO()
+            writer = csv.DictWriter(buf, fieldnames=list(df_user.columns))
+            writer.writeheader()
+            for row in df_user.to_dict(orient="records"):
+                # normalizar None a cadena vacía
+                safe_row = {k: ("" if v is None else v) for k, v in row.items()}
+                writer.writerow(safe_row)
+            csv_str = buf.getvalue()
+        except Exception:
+            # último recurso: convertir valores a strings por filas
+            rows = [",".join([str(c) for c in df_user.columns])]
+            for rec in df_user.to_dict(orient="records"):
+                rows.append(",".join([str(rec.get(c, "")) for c in df_user.columns]))
+            csv_str = "\n".join(rows) + "\n"
+
+    # encode con BOM para Excel
+    csv_bytes = csv_str.encode("utf-8-sig")
     st.download_button(
         "Descargar todas mis calificaciones (evaluador)",
         data=csv_bytes,
