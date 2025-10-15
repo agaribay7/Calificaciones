@@ -336,7 +336,7 @@ def normalize_and_validate_record(r: dict) -> dict:
 
 # -------- App UI / Logic --------
 
-st.title("Calificar jugadores por jornada — (Mejorado)")
+st.title("Calificar jugadores por jornada")
 
 # Sidebar: logo opcional
 LOGO_FILENAME = "logo_transparent.png"
@@ -798,3 +798,4 @@ else:
     )
 
 # Fin del archivo
+
