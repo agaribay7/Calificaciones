@@ -3,8 +3,7 @@
 Streamlit app — Calificar Alineaciones — Google Sheets
 Versión: mejoras de seguridad y robustez (batch updates, writes condicionales,
 detección de colisiones, cache ligera, validación de headers, etc.)
-Mantiene la lógica funcional original (ids, append/update por id, formularios).
-Selector de evaluador movido al área principal (más ancho) para mejor visibilidad.
+Se dejó el selector en la barra lateral y se inyectó CSS para aumentar su ancho.
 """
 
 import base64
@@ -18,7 +17,7 @@ import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List
 
 import pandas as pd
 import streamlit as st
@@ -35,14 +34,39 @@ if not logger.handlers:
     ch.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
     logger.addHandler(ch)
 
-# -------- SECURITY NOTE / DEBUG (NON-VERBOSE) --------
-if "GOOGLE_APPLICATION_CREDENTIALS" in st.secrets:
-    if not os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
-        try:
-            os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = st.secrets["GOOGLE_APPLICATION_CREDENTIALS"]
-            logger.debug("Se estableció GOOGLE_APPLICATION_CREDENTIALS desde st.secrets (no mostrado).")
-        except Exception:
-            logger.exception("No se pudo asignar GOOGLE_APPLICATION_CREDENTIALS desde st.secrets.")
+# -------- CSS: expandir ancho de la sidebar y desplegables --------
+# Ajusta el valor de 360px si quieres más/menos ancho.
+SIDEBAR_WIDTH_PX = 360
+st.markdown(
+    f"""
+    <style>
+    /* Target common sidebar containers (covers multiple Streamlit versions) */
+    [data-testid="stSidebar"] > div:first-child {{
+        min-width: {SIDEBAR_WIDTH_PX}px;
+        width: {SIDEBAR_WIDTH_PX}px;
+    }}
+    /* Fallback selectors used by some Streamlit builds */
+    .css-1d391kg, .css-1v3fvcr, .css-1lsmgbg {{
+        min-width: {SIDEBAR_WIDTH_PX}px !important;
+        width: {SIDEBAR_WIDTH_PX}px !important;
+    }}
+    /* Expand the listbox (dropdown options panel) */
+    div[role="listbox"] {{
+        min-width: {max(280, SIDEBAR_WIDTH_PX - 40)}px !important;
+        width: {max(280, SIDEBAR_WIDTH_PX - 40)}px !important;
+    }}
+    /* Allow selectbox label / content to wrap instead of truncating */
+    .stSelectbox div[role="button"], .stSelectbox .css-1tq9d2s {{
+        white-space: normal !important;
+    }}
+    /* Ensure sidebar widgets don't overflow horizontally */
+    [data-testid="stSidebar"] .stSelectbox, [data-testid="stSidebar"] .stTextInput {{
+        width: 100% !important;
+    }}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 # -------- CONSTANTS / CONFIG --------
 SHEET_URL = "https://docs.google.com/spreadsheets/d/1OQRTq818EXBeibBmWlrcSZm83do264l2mb5jnBmzsu8"
@@ -97,7 +121,7 @@ def safe_get(d: dict, k: str, default=None):
         return v.strip()
     return v
 
-# Retry wrapper (ya existente, sin cambios funcionales excepto logging)
+# Retry wrapper (con backoff y jitter)
 def retry_with_backoff(func, max_retries=5, base=1.0, max_backoff=16.0, *args, **kwargs):
     attempt = 0
     last_exc = None
@@ -192,7 +216,6 @@ def _session_cache_get(key: str):
         return None
     value, ts, ttl = entry.get("value"), entry.get("ts"), entry.get("ttl")
     if (time.time() - ts) > ttl:
-        # expired
         st.session_state["_cache_internal"].pop(key, None)
         return None
     return value
@@ -238,7 +261,6 @@ def load_alignments_uncached(sh, worksheet_name=ALIGN_WORKSHEET_NAME) -> pd.Data
         df = pd.DataFrame(records)
         if df.empty:
             return df
-        # normalizar nombres de columnas
         rename_map = {}
         for col in df.columns:
             if col in COLUMN_MAP:
@@ -251,10 +273,8 @@ def load_alignments_uncached(sh, worksheet_name=ALIGN_WORKSHEET_NAME) -> pd.Data
                         break
         if rename_map:
             df = df.rename(columns=rename_map)
-        # fecha parsing
         if "fecha_partido" in df.columns:
             df["fecha_partido"] = pd.to_datetime(df["fecha_partido"], errors="coerce")
-        # numeric casts
         for ncol in ["minutos", "gol", "asistencia"]:
             if ncol in df.columns:
                 df[ncol] = pd.to_numeric(df[ncol], errors="coerce").fillna(0).astype(int)
@@ -284,15 +304,11 @@ def append_rows(ws, rows):
     retry_with_backoff(lambda: ws.append_rows(rows, value_input_option="USER_ENTERED"))
 
 def batch_update_rows(spreadsheet, updates: List[Dict]):
-    """
-    updates: list of {"range": "A2:K2", "values": [[...]]}
-    """
     if not updates:
         return
     body = {"valueInputOption": "USER_ENTERED", "data": updates}
     retry_with_backoff(lambda: spreadsheet.batch_update(body))
 
-# normalize & validate record (sin cambios de comportamiento salvo logging)
 def normalize_and_validate_record(r: dict) -> dict:
     out = dict(r)
     try:
@@ -329,7 +345,7 @@ def normalize_and_validate_record(r: dict) -> dict:
 # -------- App UI / Logic --------
 st.title("Calificar jugadores por jornada")
 
-# Sidebar: logo opcional
+# Sidebar: logo opcional (queda en la sidebar)
 LOGO_FILENAME = "logo_transparent.png"
 try:
     app_dir = Path(__file__).parent
@@ -389,7 +405,7 @@ st.session_state.setdefault("evaluador", "")
 st.session_state.setdefault("pending_new_eval", "")
 st.session_state.setdefault("submitted_jornada", None)
 
-# Sidebar: evaluador list / create UI (we keep creation controls in sidebar)
+# Sidebar: evaluador list / create UI (selector ahora en sidebar, ampliado por CSS)
 existing_evaluadores = sorted({str(r).strip() for r in ratings_df["Evaluador"].dropna().unique()}) if not ratings_df.empty else []
 create_option = "— Crear nuevo evaluador —"
 placeholder_option = "— Selecciona evaluador —"
@@ -407,20 +423,15 @@ default_index = 0
 if default_value in eval_options:
     default_index = eval_options.index(default_value)
 
-# --- Opción A: mover el selectbox al área principal (más ancho) ---
-# Lo colocamos en la parte superior utilizando columnas para dar más espacio.
-col_top, _ = st.columns([3, 1])
-with col_top:
-    selected_eval = st.selectbox("Elige tu evaluador", eval_options, index=default_index, key="eval_selectbox")
+# -- Selector en la barra lateral (ahora más ancho gracias al CSS inyectado arriba) --
+selected_eval = st.sidebar.selectbox("Elige tu evaluador", eval_options, index=default_index, key="eval_selectbox")
 
-# Mantener creación en sidebar: si selecciona "Crear nuevo evaluador", el input/botón están en la sidebar.
 if selected_eval == placeholder_option:
-    st.info("Por favor selecciona o crea un evaluador para habilitar la app.")
-    st.warning("La app está inactiva hasta que selecciones o crees un evaluador.")
+    st.sidebar.info("Por favor selecciona o crea un evaluador para habilitar la app.")
+    st.warning("La app está inactiva hasta que selecciones o crees un evaluador en la barra lateral.")
     st.stop()
 
 if selected_eval == create_option:
-    # input y botón en la sidebar (para no ocupar espacio principal)
     new_eval = st.sidebar.text_input("Nuevo nombre de evaluador", value="", key="new_eval_input")
     create_pressed = st.sidebar.button("Crear y usar este nombre", key="create_eval_btn")
     st.sidebar.info("Escribe un nombre y pulsa 'Crear y usar este nombre' para habilitar la app.")
@@ -441,7 +452,7 @@ if selected_eval != create_option and selected_eval != placeholder_option:
 
 evaluador = st.session_state.get("evaluador", "")
 if not evaluador:
-    st.warning("Evaluador no establecido.")
+    st.sidebar.warning("Evaluador no establecido.")
     st.stop()
 
 st.sidebar.markdown("---")
@@ -675,7 +686,6 @@ if submitted:
     else:
         try:
             with st.spinner("Guardando calificaciones..."):
-                # refrescar ratings_df actual (sin usar cache) para evitar usar datos stale
                 current_records = safe_get_all_records(ratings_ws)
                 current_df = pd.DataFrame(current_records) if current_records else pd.DataFrame()
                 id_to_rownum = {}
@@ -685,15 +695,12 @@ if submitted:
                         if rid:
                             id_to_rownum[rid] = idx + 2  # header row 1
 
-                # preparar filas nuevas para append y filas a actualizar SOLO si hay cambios
                 rows_to_append: List[List] = []
                 batch_updates: List[Dict] = []
                 skipped_due_to_collision: List[str] = []
                 updated_count = 0
                 appended_count = 0
 
-                # Collisions: si current_df tiene timestamp distinto al timestamp que había cuando cargamos el formulario
-                # initial_timestamps_by_id almacenó timestamps al cargar el formulario.
                 for r in ratings_to_write:
                     r_clean = normalize_and_validate_record(r)
                     rid = r_clean["id"]
@@ -711,24 +718,20 @@ if submitted:
                         r_clean["timestamp"],
                     ]
                     if rid in id_to_rownum:
-                        # obtener existing row de current_df para comparar
                         try:
-                            existing_idx = id_to_rownum[rid] - 2  # back to 0-based records idx
+                            existing_idx = id_to_rownum[rid] - 2
                             existing_row = current_df.iloc[existing_idx]
-                            # collision detection: si existing_row.timestamp != initial timestamp at form load, otra sesión modificó
                             existing_ts = str(existing_row.get("timestamp", "") or "")
                             initial_ts = initial_timestamps_by_id.get(rid, "")
                             if initial_ts and existing_ts and existing_ts != initial_ts:
                                 skipped_due_to_collision.append(r_clean["Jugador"])
                                 logger.info(f"Salteando actualización por colisión (id={rid}, jugador={r_clean['Jugador']}). initial_ts={initial_ts}, existing_ts={existing_ts}")
-                                continue  # no sobrescribimos
-                            # comparar celda a celda (como strings) para decidir si update necesario
+                                continue
                             existing_values = [
                                 str(existing_row.get(col, "") if not pd.isna(existing_row.get(col, "")) else "")
                                 for col in EXPECTED_RATINGS_HEADERS
                             ]
                             new_values = [str(v) if v is not None else "" for v in row_values]
-                            # only update if content differs
                             if existing_values != new_values:
                                 rownum = id_to_rownum[rid]
                                 last_col_letter = chr(ord("A") + len(row_values) - 1)
@@ -738,7 +741,6 @@ if submitted:
                             else:
                                 logger.debug(f"No hay cambios para id={rid}, jugador={r_clean['Jugador']}. Omitiendo update.")
                         except Exception:
-                            # fallback: hacer update por seguridad
                             rownum = id_to_rownum.get(rid)
                             if rownum:
                                 last_col_letter = chr(ord("A") + len(row_values) - 1)
@@ -749,13 +751,11 @@ if submitted:
                         rows_to_append.append(row_values)
                         appended_count += 1
 
-                # Ejecutar actualizaciones en batch (siempre que haya algo)
                 if batch_updates:
                     try:
                         batch_update_rows(ratings_ws.spreadsheet, batch_updates)
                     except Exception:
                         logger.exception("Error realizando batch updates; intentando updates individuales como fallback")
-                        # fallback: intentar individualmente
                         for upd in batch_updates:
                             rng = upd["range"]
                             vals = upd["values"]
@@ -764,14 +764,12 @@ if submitted:
                             except Exception:
                                 logger.exception(f"Error actualizando rango {rng} (fallback).")
 
-                # Appends (batch)
                 if rows_to_append:
                     try:
                         append_rows(ratings_ws, rows_to_append)
                     except Exception:
                         logger.exception("Error haciendo append_rows")
 
-                # marcar sesión y notificar
                 st.session_state["submitted_jornada"] = selected_jornada
                 msg = f"Guardadas/actualizadas: {updated_count} actualizaciones, {appended_count} nuevas."
                 if skipped_due_to_collision:
@@ -780,7 +778,6 @@ if submitted:
                 st.success(msg)
                 logger.info(msg)
 
-                # invalidar caches relevantes y re-lectura inmediata para mostrar resultados
                 _session_cache_invalidate("ratings::")
                 try:
                     refreshed = safe_get_all_records(ratings_ws)
@@ -788,7 +785,6 @@ if submitted:
                 except Exception:
                     logger.exception("No se pudo refrescar calificaciones tras guardado.")
 
-                # Forzar rerun para recalcular UI como antes (mantengo rerun para comportamientos existentes)
                 st.experimental_rerun()
 
         except Exception:
@@ -824,11 +820,9 @@ if df_user.empty:
     except TypeError:
         pass
 else:
-    # Generación robusta de CSV: primero intentamos to_csv simple; si falla, usamos csv.DictWriter como fallback.
     try:
         csv_str = df_user.to_csv(index=False)
     except TypeError:
-        # fallback manual por compatibilidad con versiones antiguas de pandas
         try:
             import csv
 
@@ -836,18 +830,15 @@ else:
             writer = csv.DictWriter(buf, fieldnames=list(df_user.columns))
             writer.writeheader()
             for row in df_user.to_dict(orient="records"):
-                # normalizar None a cadena vacía
                 safe_row = {k: ("" if v is None else v) for k, v in row.items()}
                 writer.writerow(safe_row)
             csv_str = buf.getvalue()
         except Exception:
-            # último recurso: convertir valores a strings por filas
             rows = [",".join([str(c) for c in df_user.columns])]
             for rec in df_user.to_dict(orient="records"):
                 rows.append(",".join([str(rec.get(c, "")) for c in df_user.columns]))
             csv_str = "\n".join(rows) + "\n"
 
-    # encode con BOM para Excel
     csv_bytes = csv_str.encode("utf-8-sig")
     st.download_button(
         "Descargar todas mis calificaciones (evaluador)",
