@@ -11,8 +11,7 @@ Mejoras añadidas:
  - Al descargar las calificaciones del evaluador, se eliminan las columnas `id` y `timestamp` y
    se formatea `Fecha Partido` para incluir solo la fecha (YYYY-MM-DD) sin hora.
  - Prevenciones contra doble-submit y refuerzo del índice tras appends para evitar duplicados.
- - CORRECCIÓN: al crear un evaluador nuevo, ahora la ejecución continúa y el evaluador queda seleccionado
-   sin forzar rerun; evita que la app vuelva a la pantalla de creación.
+ - CORRECCIÓN: flujo de creación de evaluador evitando rerun que dejaba la app en estado inactivo.
 """
 
 import base64
@@ -445,6 +444,7 @@ st.session_state.setdefault("evaluador", "")
 st.session_state.setdefault("pending_new_eval", "")
 st.session_state.setdefault("submitted_jornada", None)
 st.session_state.setdefault("saving_in_progress", False)  # evita envíos concurrentes
+st.session_state.setdefault("created_now", False)  # marca que acabamos de crear un evaluador
 
 # Sidebar: evaluador list / create UI (selector en sidebar)
 existing_evaluadores = sorted({str(r).strip() for r in ratings_df["Evaluador"].dropna().unique()}) if not ratings_df.empty else []
@@ -456,7 +456,8 @@ if st.session_state.get("pending_new_eval"):
     pending = st.session_state["pending_new_eval"].strip()
     if pending and pending not in existing_evaluadores:
         temp_extra = [pending]
-    st.session_state["pending_new_eval"] = ""
+    # no limpiamos pending aquí; lo usaremos para mantener el candidato visible
+    # st.session_state["pending_new_eval"] = ""
 
 # Respectamos un posible valor previamente forzado del selectbox
 default_value = st.session_state.get("eval_selectbox", None)
@@ -518,7 +519,8 @@ st.markdown(
 # -- Selector en la barra lateral (debería caber por defecto ahora) --
 selected_eval = st.sidebar.selectbox("Elige tu evaluador", eval_options, index=default_index, key="eval_selectbox")
 
-if selected_eval == placeholder_option:
+# Si acabamos de crear el evaluador (created_now True) permitimos continuar en vez de st.stop()
+if selected_eval == placeholder_option and not st.session_state.get("created_now", False):
     st.sidebar.info("Por favor selecciona o crea un evaluador para habilitar la app.")
     st.warning("La app está inactiva hasta que selecciones o crees un evaluador en la barra lateral.")
     st.stop()
@@ -531,28 +533,32 @@ if selected_eval == create_option:
     create_pressed = st.sidebar.button("Crear y usar este nombre", key="create_eval_btn")
     st.sidebar.info("Escribe un nombre y pulsa 'Crear y usar este nombre' para habilitar la app.")
     if not create_pressed:
-        st.warning("La app está inactiva hasta que confirmes la creación del evaluador.")
-        st.stop()
-    if new_eval.strip() == "":
-        st.sidebar.error("El nombre no puede estar vacío.")
-        st.stop()
+        # mostrar mensaje pero no detener si acabamos de crear ahora (permite seguir)
+        if not st.session_state.get("created_now", False):
+            st.warning("La app está inactiva hasta que confirmes la creación del evaluador.")
+            st.stop()
+    else:
+        # botón fue presionado en este run: validar nombre
+        if new_eval.strip() == "":
+            st.sidebar.error("El nombre no puede estar vacío.")
+            st.stop()
 
-    # Guardamos en session_state y hacemos que el flujo siga usando el nuevo evaluador
-    nuevo = new_eval.strip()
-    st.session_state["evaluador"] = nuevo
-    st.session_state["pending_new_eval"] = nuevo
-    st.session_state["first_load"] = False
+        # Guardamos en session_state y hacemos que el flujo siga usando el nuevo evaluador
+        nuevo = new_eval.strip()
+        st.session_state["evaluador"] = nuevo
+        st.session_state["pending_new_eval"] = nuevo
+        st.session_state["first_load"] = False
+        st.session_state["created_now"] = True
 
-    # Intentamos fijar el widget selectbox en session_state (clave 'eval_selectbox')
-    try:
-        st.session_state["eval_selectbox"] = nuevo
-    except Exception:
-        logger.exception("No se pudo asignar eval_selectbox en session_state directamente.")
+        # Ajustar selectbox para mostrar el nuevo valor
+        try:
+            st.session_state["eval_selectbox"] = nuevo
+        except Exception:
+            logger.exception("No se pudo asignar eval_selectbox en session_state directamente.")
 
-    # IMPORTANTE: en lugar de forzar un rerun, seguimos la ejecución estableciendo selected_eval
-    # para que el resto del flujo lo trate como la opción seleccionada.
-    selected_eval = nuevo
-    st.sidebar.success(f"Creado evaluador: {nuevo}")
+        # IMPORTANTE: en lugar de forzar un rerun, seguimos la ejecución estableciendo selected_eval
+        selected_eval = nuevo
+        st.sidebar.success(f"Creado evaluador: {nuevo}")
 
 if selected_eval != create_option and selected_eval != placeholder_option:
     st.session_state["evaluador"] = selected_eval
@@ -914,6 +920,9 @@ if submitted:
             finally:
                 # liberar el lock siempre
                 st.session_state["saving_in_progress"] = False
+                # si venimos de crear el usuario, limpiamos la bandera created_now
+                if st.session_state.get("created_now", False):
+                    st.session_state["created_now"] = False
 
             # Forzar rerun seguro si todo se guardó
             if 'saved_ok' in locals() and saved_ok:
