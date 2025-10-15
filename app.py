@@ -8,7 +8,8 @@ Versión: mejoras de seguridad y robustez (sin cambiar funcionalidad).
 - Validaciones mínimas antes de escribir.
 - Spinner durante guardado.
 - Correcciones: manejo seguro de pd.NA y comportamiento de negritas por gol/asistencia.
-- Mejora: tras guardar correctamente se fuerza rerun para recalcular promedios inmediatamente.
+- En la PRIMERA SECCIÓN (alineación) no se muestran goles ni asistencias (solo nombre y minutos).
+- Tras guardar, se fuerza rerun para recalcular promedios inmediatamente.
 Mantiene la lógica original: ids, append/update por id, formularios, etc.
 """
 
@@ -560,7 +561,7 @@ ratings_df_local = ratings_df.copy()
 ratings_df_local["id"] = ratings_df_local.get("id", ratings_df_local.apply(lambda r: make_row_id(r.get("Jornada", ""), r.get("Jugador", ""), r.get("Evaluador", "")), axis=1))
 existing_map = {str(r["id"]): idx for idx, r in ratings_df_local.iterrows()}
 
-# Mostrar alineación & minutos
+# Mostrar alineación & minutos (PRIMERA SECCIÓN: sin mostrar goles/asistencias)
 col1, col2, col3 = st.columns([1, 2, 2])
 with col1:
     st.metric("Jornada", str(selected_jornada))
@@ -583,23 +584,19 @@ with col3:
     for idx, row in display_df.iterrows():
         jugador = str(row[player_col])
         minutos = int(row["minutos"]) if "minutos" in row.index and not pd.isna(row["minutos"]) else None
+        # obtener gol/asistencia solo para decidir si aplicamos negritas; NO se mostrarán los números aquí
         gol = int(row["gol"]) if "gol" in row.index and not pd.isna(row["gol"]) else 0
         asistencia = int(row["asistencia"]) if "asistencia" in row.index and not pd.isna(row["asistencia"]) else 0
 
         name_col, min_col = st.columns([6, 1])
 
-        # Construir bloque de info
+        # Nombre siempre en negrita.
+        # Si gol o asistencia >=1 -> también mostramos minutos en negrita (pero NO mostramos los contadores).
+        name_col.markdown(f"**{jugador}**")
         min_text = f"{minutos}'" if minutos is not None else ""
-        info_rest = f"_min: {min_text}_  \nGol: {gol}  •  Ast: {asistencia}"
-
-        # Nombre siempre en negrita; si gol o asistencia -> toda la info en negrita
         if gol >= 1 or asistencia >= 1:
-            # jugador + info todo en negritas
-            name_col.markdown(f"**{jugador}  \n{info_rest}**")
             min_col.markdown(f"**{min_text}**")
         else:
-            # solo nombre en negrita, resto normal (pero con estilo ligero)
-            name_col.markdown(f"**{jugador}**  \n{info_rest}")
             min_col.write(min_text)
 
 st.markdown("---")
@@ -623,7 +620,7 @@ if calificaciones_guardadas:
 else:
     st.info("Aún no hay calificaciones guardadas por este evaluador para esta jornada.")
 
-# Form para ingresar calificaciones
+# Form para ingresar calificaciones (AQUÍ SÍ mostramos Gol/Asistencia para referencia)
 st.subheader("Ingresa calificaciones")
 visible_df = j_df.copy().reset_index(drop=True)
 if "minutos" not in visible_df.columns:
@@ -656,7 +653,7 @@ with st.form("ratings_form_improved"):
         with a_col:
             min_display = f"{minutos}'" if minutos is not None else "—"
             info_rest = f"_min: {min_display}_  \nGol: {gol}  •  Ast: {asistencia}"
-            # Nombre siempre en negrita; si gol o asistencia -> toda la info en negrita
+            # Nombre siempre en negrita; en el formulario mostramos Gol/Asistencia para referencia
             if gol >= 1 or asistencia >= 1:
                 st.markdown(f"**{jugador}  \n{info_rest}**")
             else:
@@ -748,10 +745,8 @@ if submitted:
                 st.success(f"Guardadas/actualizadas {len(ratings_to_write)} calificaciones en Google Sheets.")
 
                 # Re-lectura inmediata para mostrar resultados y FORZAR recalculo de promedios:
-                # Actualizamos ratings_df en memoria y hacemos un rerun completo para que la UI superior se recalcule.
                 try:
                     refreshed = safe_get_all_records(ratings_ws)
-                    # opcional: actualizar variable global local
                     ratings_df = pd.DataFrame(refreshed) if refreshed else pd.DataFrame()
                 except Exception:
                     logger.exception("No se pudo refrescar calificaciones tras guardado.")
