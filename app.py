@@ -3,7 +3,13 @@
 Streamlit app — Calificar Alineaciones — Google Sheets
 Versión: ajuste automático del ancho de la barra lateral para que el selector
 de evaluador quepa por defecto (sin que el usuario tenga que redimensionar).
-Mantiene la lógica funcional original (ids, append/update por id, formularios).
+Mejoras añadidas:
+ - Normalización de strings antes de crear el `id` (evita duplicados por tildes/espacios/mayúsculas).
+ - Lectura mínima de la hoja de `Calificaciones` (solo columnas A:K) para construir mapas id->rownum/timestamp,
+   evitando cargar todo el sheet cuando no es necesario.
+ - Para comparación de filas existentes se leen filas individuales (`row_values`) en lugar de `get_all_records()` completo.
+ - Al descargar las calificaciones del evaluador, se eliminan las columnas `id` y `timestamp` y
+   se formatea `Fecha Partido` para incluir solo la fecha (YYYY-MM-DD) sin hora.
 """
 
 import base64
@@ -15,6 +21,7 @@ import os
 import random
 import re
 import time
+import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List
@@ -74,12 +81,26 @@ EXPECTED_RATINGS_HEADERS = [
 def safe_key(s: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_\-]", "_", str(s or ""))
 
+
+def normalize_str(s: str) -> str:
+    """Normaliza texto para evitar diferencias por mayúsculas, tildes y espacios extras."""
+    if s is None:
+        return ""
+    s2 = str(s).strip().lower()
+    s2 = unicodedata.normalize("NFKD", s2)
+    s2 = "".join(ch for ch in s2 if not unicodedata.combining(ch))
+    s2 = re.sub(r"\s+", " ", s2)
+    return s2
+
+
 def make_row_id(jornada: str, jugador: str, evaluador: str) -> str:
-    base = f"{jornada}|{jugador}|{evaluador}"
+    base = f"{normalize_str(jornada)}|{normalize_str(jugador)}|{normalize_str(evaluador)}"
     return hashlib.sha1(base.encode("utf-8")).hexdigest()
+
 
 def now_utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
 
 def safe_get(d: dict, k: str, default=None):
     v = d.get(k, default)
@@ -105,6 +126,7 @@ def retry_with_backoff(func, max_retries=5, base=1.0, max_backoff=16.0, *args, *
             logger.exception("Error no recuperable en operación gspread")
             raise
     raise last_exc
+
 
 def safe_get_all_records(ws):
     try:
@@ -148,6 +170,7 @@ def get_gspread_client_cached(creds):
         return None
     return gspread.authorize(creds)
 
+
 def connect_gsheets(creds, sheet_url):
     if creds is None:
         return None
@@ -160,6 +183,7 @@ def connect_gsheets(creds, sheet_url):
     except Exception:
         logger.exception("Error autenticando/abriendo la Google Sheet")
         return None
+
 
 def get_or_create_ratings_ws(sh, title=RATINGS_SHEET_NAME):
     try:
@@ -186,10 +210,12 @@ def _session_cache_get(key: str):
         return None
     return value
 
+
 def _session_cache_set(key: str, value, ttl: int = 30):
     if "_cache_internal" not in st.session_state:
         st.session_state["_cache_internal"] = {}
     st.session_state["_cache_internal"][key] = {"value": value, "ts": time.time(), "ttl": ttl}
+
 
 def _session_cache_invalidate(key_prefix: str):
     if "_cache_internal" not in st.session_state:
@@ -208,6 +234,7 @@ def load_alignments_cached(sh, worksheet_name=ALIGN_WORKSHEET_NAME, ttl_seconds=
     _session_cache_set(cache_key, df, ttl=ttl_seconds)
     return df
 
+
 def load_ratings_cached(ws, ttl_seconds=15) -> pd.DataFrame:
     cache_key = f"ratings::{ws.id if hasattr(ws,'id') else 'unknown'}::{SHEET_URL}"
     cached = _session_cache_get(cache_key)
@@ -216,6 +243,7 @@ def load_ratings_cached(ws, ttl_seconds=15) -> pd.DataFrame:
     df = load_ratings_uncached(ws)
     _session_cache_set(cache_key, df, ttl=ttl_seconds)
     return df
+
 
 def load_alignments_uncached(sh, worksheet_name=ALIGN_WORKSHEET_NAME) -> pd.DataFrame:
     try:
@@ -249,6 +277,7 @@ def load_alignments_uncached(sh, worksheet_name=ALIGN_WORKSHEET_NAME) -> pd.Data
         logger.exception("Error cargando la hoja de alineaciones (uncached)")
         return pd.DataFrame()
 
+
 def load_ratings_uncached(ws) -> pd.DataFrame:
     try:
         records = safe_get_all_records(ws)
@@ -269,11 +298,13 @@ def append_rows(ws, rows):
         return
     retry_with_backoff(lambda: ws.append_rows(rows, value_input_option="USER_ENTERED"))
 
+
 def batch_update_rows(spreadsheet, updates: List[Dict]):
     if not updates:
         return
     body = {"valueInputOption": "USER_ENTERED", "data": updates}
     retry_with_backoff(lambda: spreadsheet.batch_update(body))
+
 
 def normalize_and_validate_record(r: dict) -> dict:
     out = dict(r)
@@ -307,6 +338,37 @@ def normalize_and_validate_record(r: dict) -> dict:
     except Exception:
         out["Asistencia"] = 0
     return out
+
+# -------- Optimized helpers para index/ts (lectura mínima) --------
+
+def read_ratings_index(ws):
+    """Intenta leer solo el rango A2:K (id..timestamp) y construir mapas id->rownum y id->timestamp.
+    Si falla, hace fallback a get_all_records().
+    Devuelve (id_to_rownum, id_to_timestamp).
+    """
+    try:
+        rows = retry_with_backoff(lambda: ws.get("A2:K"))
+        id_to_rownum = {}
+        id_to_ts = {}
+        for i, row in enumerate(rows, start=2):
+            rid = str(row[0]).strip() if len(row) > 0 else ""
+            ts = str(row[10]).strip() if len(row) > 10 else ""
+            if rid:
+                id_to_rownum[rid] = i
+                id_to_ts[rid] = ts
+        return id_to_rownum, id_to_ts
+    except Exception:
+        logger.exception("No se pudo leer A2:K; fallback a get_all_records() para indexar ids")
+        records = safe_get_all_records(ws)
+        id_to_rownum = {}
+        id_to_ts = {}
+        for idx, r in enumerate(records, start=2):
+            rid = str(r.get("id", "")).strip()
+            ts = str(r.get("timestamp", "") or "")
+            if rid:
+                id_to_rownum[rid] = idx
+                id_to_ts[rid] = ts
+        return id_to_rownum, id_to_ts
 
 # -------- App UI / Logic --------
 st.title("Calificar jugadores por jornada")
@@ -363,6 +425,7 @@ if df_align is None or df_align.empty:
     st.error(f"La hoja '{ALIGN_WORKSHEET_NAME}' está vacía o no tiene registros legibles.")
     st.stop()
 
+# Cargamos las calificaciones en memoria (para UI, promedio y creación de evaluadores)
 ratings_df = load_ratings_cached(ratings_ws)
 
 # Session state defaults
@@ -392,16 +455,12 @@ if default_value in eval_options:
 # --------------------------
 # Aquí inyectamos CSS dinámico según el contenido de eval_options
 # --------------------------
-# Estimación simple del ancho necesario en px:
-# - asumimos ~8px por carácter (promedio), y añadimos padding extra.
-# - ponemos límites min/max para no romper el layout.
 max_label_len = 0
 try:
     max_label_len = max(len(str(o)) for o in eval_options) if eval_options else 30
 except Exception:
     max_label_len = 30
 
-# parámetros de control (ajusta si quieres)
 CHAR_WIDTH_PX = 8
 HORIZONTAL_PADDING_PX = 120  # espacio adicional para padding / iconos / scrollbar
 MIN_SIDEBAR_PX = 300
@@ -410,7 +469,6 @@ MAX_SIDEBAR_PX = 900
 computed_width = max(MIN_SIDEBAR_PX, min(MAX_SIDEBAR_PX, max_label_len * CHAR_WIDTH_PX + HORIZONTAL_PADDING_PX))
 listbox_min_width = max(280, computed_width - 40)
 
-# Inyectar CSS usando el ancho calculado
 st.markdown(
     f"""
     <style>
@@ -705,14 +763,8 @@ if submitted:
     else:
         try:
             with st.spinner("Guardando calificaciones..."):
-                current_records = safe_get_all_records(ratings_ws)
-                current_df = pd.DataFrame(current_records) if current_records else pd.DataFrame()
-                id_to_rownum = {}
-                if not current_df.empty:
-                    for idx, r in current_df.iterrows():
-                        rid = str(r.get("id", "")).strip()
-                        if rid:
-                            id_to_rownum[rid] = idx + 2  # header row 1
+                # Leemos solo ids y timestamps para comprobar colisiones y para construir id->rownum
+                id_to_rownum, id_to_ts = read_ratings_index(ratings_ws)
 
                 rows_to_append: List[List] = []
                 batch_updates: List[Dict] = []
@@ -738,21 +790,25 @@ if submitted:
                     ]
                     if rid in id_to_rownum:
                         try:
-                            existing_idx = id_to_rownum[rid] - 2
-                            existing_row = current_df.iloc[existing_idx]
-                            existing_ts = str(existing_row.get("timestamp", "") or "")
+                            rownum = id_to_rownum[rid]
+                            existing_ts = id_to_ts.get(rid, "")
                             initial_ts = initial_timestamps_by_id.get(rid, "")
                             if initial_ts and existing_ts and existing_ts != initial_ts:
                                 skipped_due_to_collision.append(r_clean["Jugador"])
                                 logger.info(f"Salteando actualización por colisión (id={rid}, jugador={r_clean['Jugador']}). initial_ts={initial_ts}, existing_ts={existing_ts}")
                                 continue
-                            existing_values = [
-                                str(existing_row.get(col, "") if not pd.isna(existing_row.get(col, "")) else "")
-                                for col in EXPECTED_RATINGS_HEADERS
-                            ]
+
+                            # Leemos la fila existente para comparar (lectura puntual)
+                            try:
+                                existing_row_values = retry_with_backoff(lambda: ratings_ws.row_values(rownum))
+                            except Exception:
+                                existing_row_values = []
+
+                            # Alinear longitud
+                            existing_values = [str(existing_row_values[i]) if i < len(existing_row_values) else "" for i in range(len(row_values))]
                             new_values = [str(v) if v is not None else "" for v in row_values]
+
                             if existing_values != new_values:
-                                rownum = id_to_rownum[rid]
                                 last_col_letter = chr(ord("A") + len(row_values) - 1)
                                 rng = f"A{rownum}:{last_col_letter}{rownum}"
                                 batch_updates.append({"range": rng, "values": [row_values]})
@@ -760,6 +816,7 @@ if submitted:
                             else:
                                 logger.debug(f"No hay cambios para id={rid}, jugador={r_clean['Jugador']}. Omitiendo update.")
                         except Exception:
+                            # fallback: si algo falla intentamos poner update por rownum
                             rownum = id_to_rownum.get(rid)
                             if rownum:
                                 last_col_letter = chr(ord("A") + len(row_values) - 1)
@@ -799,6 +856,7 @@ if submitted:
 
                 _session_cache_invalidate("ratings::")
                 try:
+                    # refrescar cache ligera
                     refreshed = safe_get_all_records(ratings_ws)
                     ratings_df = pd.DataFrame(refreshed) if refreshed else pd.DataFrame()
                 except Exception:
@@ -830,7 +888,7 @@ if df_user.empty:
     st.info("No se encontraron calificaciones guardadas por este evaluador.")
     try:
         st.download_button(
-            "Descargar todas mis calificaciones",
+            "Descargar todas mis calificaciones (evaluador)",
             data="",
             file_name=f"calificaciones_{safe_key(evaluador)}.csv",
             mime="text/csv",
@@ -840,32 +898,45 @@ if df_user.empty:
         pass
 else:
     try:
-        csv_str = df_user.to_csv(index=False)
+        # transformaciones pedidas: eliminar columnas id y timestamp; formatear Fecha Partido a solo fecha
+        df_export = df_user.copy()
+        for c in ["id", "timestamp"]:
+            if c in df_export.columns:
+                df_export.drop(columns=[c], inplace=True)
+
+        if "Fecha Partido" in df_export.columns:
+            try:
+                df_export["Fecha Partido"] = pd.to_datetime(df_export["Fecha Partido"], errors="coerce").dt.date
+                # convertir a string YYYY-MM-DD y rellenar vacíos
+                df_export["Fecha Partido"] = df_export["Fecha Partido"].apply(lambda d: d.isoformat() if pd.notna(d) else "")
+            except Exception:
+                logger.exception("No se pudo formatear 'Fecha Partido' al exportar; se deja como estaba.")
+
+        csv_str = df_export.to_csv(index=False)
     except TypeError:
         try:
             import csv
 
             buf = io.StringIO()
-            writer = csv.DictWriter(buf, fieldnames=list(df_user.columns))
+            writer = csv.DictWriter(buf, fieldnames=list(df_export.columns))
             writer.writeheader()
-            for row in df_user.to_dict(orient="records"):
+            for row in df_export.to_dict(orient="records"):
                 safe_row = {k: ("" if v is None else v) for k, v in row.items()}
                 writer.writerow(safe_row)
             csv_str = buf.getvalue()
         except Exception:
-            rows = [",".join([str(c) for c in df_user.columns])]
-            for rec in df_user.to_dict(orient="records"):
-                rows.append(",".join([str(rec.get(c, "")) for c in df_user.columns]))
+            rows = [",".join([str(c) for c in df_export.columns])]
+            for rec in df_export.to_dict(orient="records"):
+                rows.append(",".join([str(rec.get(c, "")) for c in df_export.columns])
+            )
             csv_str = "\n".join(rows) + "\n"
 
     csv_bytes = csv_str.encode("utf-8-sig")
     st.download_button(
-        "Descargar todas mis calificaciones",
+        "Descargar todas mis calificaciones (evaluador)",
         data=csv_bytes,
         file_name=f"calificaciones_{safe_key(evaluador)}.csv",
         mime="text/csv",
     )
 
 # Fin del archivo
-
-
