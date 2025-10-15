@@ -837,12 +837,12 @@ if submitted:
                     if rid in id_to_rownum:
                         try:
                             rownum = id_to_rownum[rid]
+                            # Forzar sobrescritura: ignorar el 'continue' por colisión de timestamp.
+                            # Registramos en logs si hubo diferencia, pero procederemos a planificar el update.
                             existing_ts = id_to_ts.get(rid, "")
                             initial_ts = initial_timestamps_by_id.get(rid, "")
                             if initial_ts and existing_ts and existing_ts != initial_ts:
-                                skipped_due_to_collision.append(r_clean["Jugador"])
-                                logger.info(f"Salteando actualización por colisión (id={rid}, jugador={r_clean['Jugador']}). initial_ts={initial_ts}, existing_ts={existing_ts}")
-                                continue
+                                logger.info(f"Colisión detectada pero se procederá a sobrescribir (id={rid}, jugador={r_clean['Jugador']}). initial_ts={initial_ts}, existing_ts={existing_ts}")
 
                             # Leemos la fila existente para comparar (lectura puntual)
                             try:
