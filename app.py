@@ -876,9 +876,9 @@ if submitted:
             # porque en algunas builds esa llamada puede propagar excepciones internas (AttributeError)
             # que rompen la app. En su lugar ajustamos un query param que provoca un rerun seguro.
             try:
-                params = st.experimental_get_query_params()
+                params = dict(st.query_params)
                 params['_ts'] = [str(time.time())]
-                st.experimental_set_query_params(**params)
+                st.query_params = params
             except Exception:
                 logger.exception('No se pudo forzar rerun vía query params; intentando st.experimental_rerun() como fallback')
                 try:
