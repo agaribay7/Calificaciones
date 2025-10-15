@@ -315,7 +315,8 @@ def normalize_and_validate_record(r: dict) -> dict:
         out["Calificacion"] = ""
     try:
         m = out.get("Minutos", "")
-        if m in (None, "", pd.NA):
+        # usar pd.isna para cubrir pd.NA / NaN / None
+        if pd.isna(m) or m in (None, ""):
             out["Minutos"] = ""
         else:
             out["Minutos"] = int(m)
@@ -657,7 +658,7 @@ with st.form("ratings_form_improved"):
             "Jugador": jugador,
             "Evaluador": str(evaluador),
             "Calificacion": float(cal_val),
-            "Minutos": minutos if minutos not in (None, "", pd.NA) else "",
+            "Minutos": minutos if (not pd.isna(minutos) and minutos not in (None, "")) else "",
             "Gol": int(gol),
             "Asistencia": int(asistencia),
             "Resultado": str(resultado_partido) if resultado_partido is not None else "",
