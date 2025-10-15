@@ -2,8 +2,9 @@
 """
 Streamlit app — Calificar Alineaciones — Google Sheets
 Versión: mejoras de seguridad y robustez (batch updates, writes condicionales,
-detección de colisiones, cache ligera, validación de headers, last sync, etc.)
+detección de colisiones, cache ligera, validación de headers, etc.)
 Mantiene la lógica funcional original (ids, append/update por id, formularios).
+Se eliminó la visualización/registro de 'última sync' por petición.
 """
 
 import base64
@@ -216,8 +217,6 @@ def load_alignments_cached(sh, worksheet_name=ALIGN_WORKSHEET_NAME, ttl_seconds=
         return cached
     df = load_alignments_uncached(sh, worksheet_name)
     _session_cache_set(cache_key, df, ttl=ttl_seconds)
-    # store last sync
-    st.session_state["last_sync_alignments"] = now_utc_iso()
     return df
 
 def load_ratings_cached(ws, ttl_seconds=15) -> pd.DataFrame:
@@ -227,7 +226,6 @@ def load_ratings_cached(ws, ttl_seconds=15) -> pd.DataFrame:
         return cached
     df = load_ratings_uncached(ws)
     _session_cache_set(cache_key, df, ttl=ttl_seconds)
-    st.session_state["last_sync_ratings"] = now_utc_iso()
     return df
 
 def load_alignments_uncached(sh, worksheet_name=ALIGN_WORKSHEET_NAME) -> pd.DataFrame:
@@ -781,8 +779,6 @@ if submitted:
                 try:
                     refreshed = safe_get_all_records(ratings_ws)
                     ratings_df = pd.DataFrame(refreshed) if refreshed else pd.DataFrame()
-                    # guardar última sincronización
-                    st.session_state["last_sync_ratings"] = now_utc_iso()
                 except Exception:
                     logger.exception("No se pudo refrescar calificaciones tras guardado.")
 
@@ -853,11 +849,5 @@ else:
         file_name=f"calificaciones_{safe_key(evaluador)}.csv",
         mime="text/csv",
     )
-
-# Mostrar info de última sincronización
-st.markdown("---")
-last_align = st.session_state.get("last_sync_alignments", "N/A")
-last_ratings = st.session_state.get("last_sync_ratings", "N/A")
-st.info(f"Última sync - Alineaciones: {last_align}  |  Calificaciones: {last_ratings}")
 
 # Fin del archivo
