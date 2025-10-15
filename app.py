@@ -3,15 +3,9 @@
 Streamlit app — Calificar Alineaciones — Google Sheets
 Versión: ajuste automático del ancho de la barra lateral para que el selector
 de evaluador quepa por defecto (sin que el usuario tenga que redimensionar).
-Mejoras añadidas:
- - Normalización de strings antes de crear el `id` (evita duplicados por tildes/espacios/mayúsculas).
- - Lectura mínima de la hoja de `Calificaciones` (solo columnas A:K) para construir mapas id->rownum/timestamp,
-   evitando cargar todo el sheet cuando no es necesario.
- - Para comparación de filas existentes se leen filas individuales (`row_values`) en lugar de `get_all_records()` completo.
- - Al descargar las calificaciones del evaluador, se eliminan las columnas `id` y `timestamp` y
-   se formatea `Fecha Partido` para incluir solo la fecha (YYYY-MM-DD) sin hora.
- - Prevenciones contra doble-submit y refuerzo del índice tras appends para evitar duplicados.
- - CORRECCIÓN: flujo de creación de evaluador evitando rerun que dejaba la app en estado inactivo.
+Mejoras: normalización de ids, lectura mínima A2:K para index, batching, prevención de duplicados,
+descarga sin id/timestamp y Fecha Partido sin hora.
+Correcciones: persistencia del selectbox al hacer submit con Enter y permitir editar jornadas ya enviadas.
 """
 
 import base64
@@ -445,28 +439,39 @@ st.session_state.setdefault("pending_new_eval", "")
 st.session_state.setdefault("submitted_jornada", None)
 st.session_state.setdefault("saving_in_progress", False)  # evita envíos concurrentes
 st.session_state.setdefault("created_now", False)  # marca que acabamos de crear un evaluador
+st.session_state.setdefault("eval_selectbox", st.session_state.get("evaluador", ""))  # persistencia del selectbox
 
 # Sidebar: evaluador list / create UI (selector en sidebar)
 existing_evaluadores = sorted({str(r).strip() for r in ratings_df["Evaluador"].dropna().unique()}) if not ratings_df.empty else []
 create_option = "— Crear nuevo evaluador —"
 placeholder_option = "— Selecciona evaluador —"
 
+# No limpiar pending_new_eval aquí — lo necesitamos persistente durante reruns
 temp_extra = []
-if st.session_state.get("pending_new_eval"):
-    pending = st.session_state["pending_new_eval"].strip()
+pending_candidate = st.session_state.get("pending_new_eval", "")
+if pending_candidate:
+    pending = pending_candidate.strip()
     if pending and pending not in existing_evaluadores:
-        temp_extra = [pending]
-    # no limpiamos pending aquí; lo usaremos para mantener el candidato visible
-    # st.session_state["pending_new_eval"] = ""
+        temp_extra.append(pending)
 
-# Respectamos un posible valor previamente forzado del selectbox
+# Asegurar que si ya hay un evaluador en session_state, aparece en las opciones
+current_eval = st.session_state.get("evaluador", "")
+if current_eval and current_eval not in existing_evaluadores and current_eval not in temp_extra:
+    temp_extra.append(current_eval)
+
+# Respectamos un posible valor previamente forzado del selectbox (eval_selectbox)
 default_value = st.session_state.get("eval_selectbox", None)
 if default_value is None:
     default_value = placeholder_option if st.session_state.get("first_load", False) else (st.session_state.get("evaluador") or placeholder_option)
+
 eval_options = [placeholder_option] + existing_evaluadores + temp_extra + [create_option]
 default_index = 0
 if default_value in eval_options:
     default_index = eval_options.index(default_value)
+else:
+    # si el default_value no está (p.ej. valor nuevo), añadimos y usamos ese índice
+    eval_options.insert(1, default_value)
+    default_index = 1
 
 # --------------------------
 # Aquí inyectamos CSS dinámico según el contenido de eval_options
@@ -493,7 +498,7 @@ st.markdown(
         min-width: {computed_width}px;
         width: {computed_width}px;
     }}
-    /* Fallback selectors used por algunas builds de Streamlit */
+    /* Fallback selectors used por algunas Streamlit builds */
     .css-1d391kg, .css-1v3fvcr, .css-1lsmgbg {{
         min-width: {computed_width}px !important;
         width: {computed_width}px !important;
@@ -795,147 +800,146 @@ with st.form("ratings_form_improved"):
 
 # Guardado (append/update por id) con writes condicionales y batch_update
 if submitted:
-    if st.session_state.get("submitted_jornada") == selected_jornada:
-        st.warning("Ya enviaste calificaciones para esta jornada en esta sesión. Evita envíos duplicados.")
+    # Ya no bloqueamos la edición si selected_jornada coincide con submitted_jornada;
+    # permitimos editar jornadas ya guardadas.
+    if st.session_state.get("saving_in_progress", False):
+        st.warning("Ya hay un guardado en curso en esta sesión. Espera a que termine.")
     else:
-        # Prevención: si ya hay un guardado en proceso en esta sesión, lo bloqueamos
-        if st.session_state.get("saving_in_progress", False):
-            st.warning("Ya hay un guardado en curso en esta sesión. Espera a que termine.")
-        else:
-            st.session_state["saving_in_progress"] = True
-            saved_ok = False
-            try:
-                with st.spinner("Guardando calificaciones..."):
-                    # Leemos solo ids y timestamps para comprobar colisiones y para construir id->rownum
-                    id_to_rownum, id_to_ts = read_ratings_index(ratings_ws)
+        st.session_state["saving_in_progress"] = True
+        saved_ok = False
+        try:
+            with st.spinner("Guardando calificaciones..."):
+                # Leemos solo ids y timestamps para comprobar colisiones y para construir id->rownum
+                id_to_rownum, id_to_ts = read_ratings_index(ratings_ws)
 
-                    rows_to_append: List[List] = []
-                    batch_updates: List[Dict] = []
-                    skipped_due_to_collision: List[str] = []
-                    updated_count = 0
-                    appended_count = 0
+                rows_to_append: List[List] = []
+                batch_updates: List[Dict] = []
+                skipped_due_to_collision: List[str] = []
+                updated_count = 0
+                appended_count = 0
 
-                    for r in ratings_to_write:
-                        r_clean = normalize_and_validate_record(r)
-                        rid = r_clean["id"]
-                        row_values = [
-                            rid,
-                            r_clean["Jornada"],
-                            r_clean["Jugador"],
-                            r_clean["Evaluador"],
-                            r_clean["Calificacion"],
-                            r_clean["Minutos"],
-                            r_clean["Gol"],
-                            r_clean["Asistencia"],
-                            r_clean["Resultado"],
-                            r_clean["Fecha Partido"],
-                            r_clean["timestamp"],
-                        ]
-                        if rid in id_to_rownum:
+                for r in ratings_to_write:
+                    r_clean = normalize_and_validate_record(r)
+                    rid = r_clean["id"]
+                    row_values = [
+                        rid,
+                        r_clean["Jornada"],
+                        r_clean["Jugador"],
+                        r_clean["Evaluador"],
+                        r_clean["Calificacion"],
+                        r_clean["Minutos"],
+                        r_clean["Gol"],
+                        r_clean["Asistencia"],
+                        r_clean["Resultado"],
+                        r_clean["Fecha Partido"],
+                        r_clean["timestamp"],
+                    ]
+                    if rid in id_to_rownum:
+                        try:
+                            rownum = id_to_rownum[rid]
+                            existing_ts = id_to_ts.get(rid, "")
+                            initial_ts = initial_timestamps_by_id.get(rid, "")
+                            if initial_ts and existing_ts and existing_ts != initial_ts:
+                                skipped_due_to_collision.append(r_clean["Jugador"])
+                                logger.info(f"Salteando actualización por colisión (id={rid}, jugador={r_clean['Jugador']}). initial_ts={initial_ts}, existing_ts={existing_ts}")
+                                continue
+
+                            # Leemos la fila existente para comparar (lectura puntual)
                             try:
-                                rownum = id_to_rownum[rid]
-                                existing_ts = id_to_ts.get(rid, "")
-                                initial_ts = initial_timestamps_by_id.get(rid, "")
-                                if initial_ts and existing_ts and existing_ts != initial_ts:
-                                    skipped_due_to_collision.append(r_clean["Jugador"])
-                                    logger.info(f"Salteando actualización por colisión (id={rid}, jugador={r_clean['Jugador']}). initial_ts={initial_ts}, existing_ts={existing_ts}")
-                                    continue
-
-                                # Leemos la fila existente para comparar (lectura puntual)
-                                try:
-                                    existing_row_values = retry_with_backoff(lambda: ratings_ws.row_values(rownum))
-                                except Exception:
-                                    existing_row_values = []
-
-                                # Alinear longitud
-                                existing_values = [str(existing_row_values[i]) if i < len(existing_row_values) else "" for i in range(len(row_values))]
-                                new_values = [str(v) if v is not None else "" for v in row_values]
-
-                                if existing_values != new_values:
-                                    last_col_letter = chr(ord("A") + len(row_values) - 1)
-                                    rng = f"A{rownum}:{last_col_letter}{rownum}"
-                                    batch_updates.append({"range": rng, "values": [row_values]})
-                                    updated_count += 1
-                                else:
-                                    logger.debug(f"No hay cambios para id={rid}, jugador={r_clean['Jugador']}. Omitiendo update.")
+                                existing_row_values = retry_with_backoff(lambda: ratings_ws.row_values(rownum))
                             except Exception:
-                                rownum = id_to_rownum.get(rid)
-                                if rownum:
-                                    last_col_letter = chr(ord("A") + len(row_values) - 1)
-                                    rng = f"A{rownum}:{last_col_letter}{rownum}"
-                                    batch_updates.append({"range": rng, "values": [row_values]})
-                                    updated_count += 1
-                        else:
-                            rows_to_append.append(row_values)
-                            appended_count += 1
+                                existing_row_values = []
 
-                    # Ejecutar updates
-                    if batch_updates:
-                        try:
-                            batch_update_rows(ratings_ws.spreadsheet, batch_updates)
+                            # Alinear longitud
+                            existing_values = [str(existing_row_values[i]) if i < len(existing_row_values) else "" for i in range(len(row_values))]
+                            new_values = [str(v) if v is not None else "" for v in row_values]
+
+                            if existing_values != new_values:
+                                last_col_letter = chr(ord("A") + len(row_values) - 1)
+                                rng = f"A{rownum}:{last_col_letter}{rownum}"
+                                batch_updates.append({"range": rng, "values": [row_values]})
+                                updated_count += 1
+                            else:
+                                logger.debug(f"No hay cambios para id={rid}, jugador={r_clean['Jugador']}. Omitiendo update.")
                         except Exception:
-                            logger.exception("Error realizando batch updates; intentando updates individuales como fallback")
-                            for upd in batch_updates:
-                                rng = upd["range"]
-                                vals = upd["values"]
-                                try:
-                                    retry_with_backoff(lambda: ratings_ws.update(rng, vals, value_input_option="USER_ENTERED"))
-                                except Exception:
-                                    logger.exception(f"Error actualizando rango {rng} (fallback).")
+                            rownum = id_to_rownum.get(rid)
+                            if rownum:
+                                last_col_letter = chr(ord("A") + len(row_values) - 1)
+                                rng = f"A{rownum}:{last_col_letter}{rownum}"
+                                batch_updates.append({"range": rng, "values": [row_values]})
+                                updated_count += 1
+                    else:
+                        rows_to_append.append(row_values)
+                        appended_count += 1
 
-                    # Ejecutar appends en batches para robustez y evitar timeouts
-                    if rows_to_append:
-                        try:
-                            # chunk size configurable
-                            CHUNK = 200
-                            for i in range(0, len(rows_to_append), CHUNK):
-                                chunk = rows_to_append[i : i + CHUNK]
-                                append_rows(ratings_ws, chunk)
-                                # Tras cada append chunk refrescamos el índice para evitar que
-                                # el mismo run termine creando duplicados
-                                id_to_rownum, id_to_ts = read_ratings_index(ratings_ws)
-                        except Exception:
-                            logger.exception("Error haciendo append_rows")
-
-                    st.session_state["submitted_jornada"] = selected_jornada
-                    msg = f"Guardadas/actualizadas: {updated_count} actualizaciones, {appended_count} nuevas."
-                    if skipped_due_to_collision:
-                        msg += f" {len(skipped_due_to_collision)} filas saltadas por colisión: {', '.join(skipped_due_to_collision)}."
-                        st.warning(f"Se saltaron {len(skipped_due_to_collision)} filas porque fueron modificadas por otra sesión (ver detalles).")
-                    st.success(msg)
-                    logger.info(msg)
-
-                    _session_cache_invalidate("ratings::")
+                # Ejecutar updates
+                if batch_updates:
                     try:
-                        refreshed = safe_get_all_records(ratings_ws)
-                        ratings_df = pd.DataFrame(refreshed) if refreshed else pd.DataFrame()
+                        batch_update_rows(ratings_ws.spreadsheet, batch_updates)
                     except Exception:
-                        logger.exception("No se pudo refrescar calificaciones tras guardado.")
+                        logger.exception("Error realizando batch updates; intentando updates individuales como fallback")
+                        for upd in batch_updates:
+                            rng = upd["range"]
+                            vals = upd["values"]
+                            try:
+                                retry_with_backoff(lambda: ratings_ws.update(rng, vals, value_input_option="USER_ENTERED"))
+                            except Exception:
+                                logger.exception(f"Error actualizando rango {rng} (fallback).")
 
-                    saved_ok = True
+                # Ejecutar appends en batches para robustez y evitar timeouts
+                if rows_to_append:
+                    try:
+                        # chunk size configurable
+                        CHUNK = 200
+                        for i in range(0, len(rows_to_append), CHUNK):
+                            chunk = rows_to_append[i : i + CHUNK]
+                            append_rows(ratings_ws, chunk)
+                            # Tras cada append chunk refrescamos el índice para evitar que
+                            # el mismo run termine creando duplicados
+                            id_to_rownum, id_to_ts = read_ratings_index(ratings_ws)
+                    except Exception:
+                        logger.exception("Error haciendo append_rows")
 
-            except Exception:
-                logger.exception("Error procesando guardado por lote")
-                st.error("Ocurrió un error al guardar. Revisa logs.")
-            finally:
-                # liberar el lock siempre
-                st.session_state["saving_in_progress"] = False
-                # si venimos de crear el usuario, limpiamos la bandera created_now
-                if st.session_state.get("created_now", False):
-                    st.session_state["created_now"] = False
+                st.session_state["submitted_jornada"] = selected_jornada
+                msg = f"Guardadas/actualizadas: {updated_count} actualizaciones, {appended_count} nuevas."
+                if skipped_due_to_collision:
+                    msg += f" {len(skipped_due_to_collision)} filas saltadas por colisión: {', '.join(skipped_due_to_collision)}."
+                    st.warning(f"Se saltaron {len(skipped_due_to_collision)} filas porque fueron modificadas por otra sesión (ver detalles).")
+                st.success(msg)
+                logger.info(msg)
 
-            # Forzar rerun seguro si todo se guardó
-            if 'saved_ok' in locals() and saved_ok:
+                _session_cache_invalidate("ratings::")
                 try:
-                    params = dict(st.query_params)
-                    params['_ts'] = [str(time.time())]
-                    st.query_params = params
+                    refreshed = safe_get_all_records(ratings_ws)
+                    ratings_df = pd.DataFrame(refreshed) if refreshed else pd.DataFrame()
                 except Exception:
-                    logger.exception('No se pudo forzar rerun vía query params; intentando st.experimental_rerun() como fallback')
-                    try:
-                        st.experimental_rerun()
-                    except Exception:
-                        logger.exception('st.experimental_rerun() lanzó excepción en el fallback (se ignora).')
+                    logger.exception("No se pudo refrescar calificaciones tras guardado.")
+
+                saved_ok = True
+
+        except Exception:
+            logger.exception("Error procesando guardado por lote")
+            st.error("Ocurrió un error al guardar. Revisa logs.")
+        finally:
+            # liberar el lock siempre
+            st.session_state["saving_in_progress"] = False
+            # limpiar bandera created_now si venimos de crear usuario
+            if st.session_state.get("created_now", False):
+                st.session_state["created_now"] = False
+
+        # En lugar de forzar un rerun (que puede resetear el selectbox),
+        # aseguramos persistencia del selectbox y recargamos en memoria
+        if 'saved_ok' in locals() and saved_ok:
+            try:
+                st.session_state["eval_selectbox"] = st.session_state.get("evaluador", evaluador)
+            except Exception:
+                logger.exception("No se pudo asegurar eval_selectbox en session_state tras guardado.")
+            try:
+                _session_cache_invalidate("ratings::")
+                ratings_df = load_ratings_cached(ratings_ws)
+                logger.info("Recargadas calificaciones en memoria tras guardado (sin rerun).")
+            except Exception:
+                logger.exception("No se pudo refrescar calificaciones tras guardado (sin rerun).")
 
 # ======================
 # Descarga: todas las calificaciones del evaluador (SIN mostrar tabla)
