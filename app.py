@@ -1,28 +1,21 @@
 # app.py
 """
 Streamlit app — Calificar Alineaciones — Google Sheets
-Corrección: muestra una leyenda persistente "Evaluando: <nombre>" en la sidebar
-mientras haya un evaluador seleccionado en la sesión.
-Además: muestra un logo (con transparencia) encima del apartado lateral "Configuración",
-centrado y con tamaño ajustable.
-También: muestra el promedio de las calificaciones **ya guardadas** por el evaluador
-para la jornada seleccionada, justo encima del formulario de calificaciones.
-
-Nota: integración segura con st.secrets para credentials. Si no hay st.secrets,
-se intenta usar el fichero local (CRED_FOLDER) como fallback para desarrollo.
+Versión: lee alineaciones desde la Google Sheet (worksheet "Alineaciones").
+Mantiene la pestaña "Calificaciones" para leer/guardar las calificaciones.
+Credenciales: desde st.secrets (gcp_service_account o SERVICE_ACCOUNT_JSON) o
+GOOGLE_APPLICATION_CREDENTIALS / fichero local como fallback (solo para dev).
 """
 
-import sys
-from pathlib import Path
-from datetime import datetime
-import re
-import time
-import io
-import base64
 import json
 import os
+import io
+import base64
+import re
+import time
+from pathlib import Path
+from datetime import datetime
 
-# Dependencias: asume instaladas en el entorno
 import streamlit as st
 import pandas as pd
 import gspread
@@ -31,12 +24,12 @@ from gspread.exceptions import APIError
 from PIL import Image
 
 # ------------------ CONFIG ------------------
-# Ajusta la ruta de tu carpeta de credenciales/Excel si es necesario
+# Fallback local (solo desarrollo). En Cloud no debe usarse.
 CRED_FOLDER = Path(r"C:\Users\agaribayda\Documents\Streamlit Calificaciones AP25")
 CRED_PREFIX = "credenciales"
-EXCEL_PATH = CRED_FOLDER / "AlineacionesAP25.xlsx"
 
 SHEET_URL = "https://docs.google.com/spreadsheets/d/1OQRTq818EXBeibBmWlrcSZm83do264l2mb5jnBmzsu8"
+ALIGN_WORKSHEET_NAME = "Alineaciones"   # <-- tu nombre de hoja para alineaciones
 RATINGS_SHEET_NAME = "Calificaciones"
 
 SCOPES = [
@@ -49,30 +42,24 @@ SCOPES = [
 st.set_page_config(page_title="Calificar Alineaciones — Google Sheets", layout="wide")
 st.title("Calificar jugadores por jornada")
 
-# ------------------ Sidebar: imagen (centrada y más grande) ------------------
-# Nombre del archivo del logo (está en la misma carpeta que app.py)
+# ------------------ Sidebar: logo (centrado) ------------------
 LOGO_FILENAME = "logo_transparent.png"
-LOGO_WIDTH = 240  # ancho en píxeles; sube este valor para una imagen más grande
+LOGO_WIDTH = 240
 
 try:
     app_dir = Path(__file__).parent
 except Exception:
-    # fallback en caso de ejecución en entornos donde __file__ no está definido
     app_dir = Path.cwd()
 
 logo_path = app_dir / LOGO_FILENAME
-
 if logo_path.exists():
     try:
-        # Abrir y forzar RGBA (mantiene transparencia)
         logo_img = Image.open(logo_path).convert("RGBA")
-        # Redimensionar manteniendo proporción
         w, h = logo_img.size
         if w > 0:
             new_w = LOGO_WIDTH
             new_h = int(h * new_w / w)
             logo_img = logo_img.resize((new_w, new_h), Image.LANCZOS)
-        # Convertir a base64 para embeber en HTML (permite centrar fácilmente)
         buffered = io.BytesIO()
         logo_img.save(buffered, format="PNG")
         img_b64 = base64.b64encode(buffered.getvalue()).decode()
@@ -85,122 +72,80 @@ if logo_path.exists():
     except Exception as e:
         st.sidebar.warning("No se pudo cargar el logo de la sidebar.")
         st.sidebar.exception(e)
-else:
-    # si no existe la imagen, no hacemos nada
-    pass
 
-# ------------------ CONFIG (sidebar header) ------------------
 st.sidebar.header("Configuración")
 
-# ------------------ Helpers ------------------
+# ------------------ Helpers credenciales / gspread ------------------
 def find_credentials_file(folder: Path, prefix="credenciales"):
-    if not folder.exists():
+    try:
+        if not folder.exists():
+            return None
+        for p in folder.iterdir():
+            if p.is_file() and p.name.lower().startswith(prefix.lower()):
+                return p
+    except Exception:
         return None
-    for p in folder.iterdir():
-        if p.is_file() and p.name.lower().startswith(prefix.lower()):
-            return p
     return None
 
 def get_credentials_from_st_secrets_or_env(scopes):
     """
-    Intenta obtener credenciales en este orden:
-      1) st.secrets["SERVICE_ACCOUNT_JSON"]  -> string JSON o dict
-      2) st.secrets["gcp_service_account"]   -> dict
-      3) GOOGLE_APPLICATION_CREDENTIALS env var -> ruta a fichero JSON
-    Devuelve google.oauth2.service_account.Credentials o None.
+    Order:
+      1) st.secrets["SERVICE_ACCOUNT_JSON"]  (string JSON or dict)
+      2) st.secrets["gcp_service_account"]   (map/dict)
+      3) GOOGLE_APPLICATION_CREDENTIALS env var (path)
+      4) local credential file (CRED_FOLDER)  <- only for dev
     """
-    # 1) SERVICE_ACCOUNT_JSON en st.secrets
+    # 1) SERVICE_ACCOUNT_JSON
     try:
         if "SERVICE_ACCOUNT_JSON" in st.secrets:
             sa_raw = st.secrets["SERVICE_ACCOUNT_JSON"]
-            if isinstance(sa_raw, str):
-                # en la UI de Streamlit puedes pegar el JSON como string
-                sa_info = json.loads(sa_raw)
-            elif isinstance(sa_raw, dict):
+            if isinstance(sa_raw, dict):
                 sa_info = sa_raw
             else:
-                # por si Streamlit devolviera otro tipo extraño
-                sa_info = json.loads(str(sa_raw))
-            creds = Credentials.from_service_account_info(sa_info, scopes=scopes)
-            return creds
+                # si es string, parsear
+                sa_info = json.loads(sa_raw)
+            return Credentials.from_service_account_info(sa_info, scopes=scopes)
     except Exception as e:
-        st.error("Error parsing SERVICE_ACCOUNT_JSON desde st.secrets (asegúrate de pegar JSON válido).")
-        st.exception(e)
-        return None
+        st.warning("SERVICE_ACCOUNT_JSON presente pero no parseable: " + str(e))
 
-    # 2) gcp_service_account (bloque/tabla) en st.secrets
+    # 2) gcp_service_account (bloque)
     try:
         if "gcp_service_account" in st.secrets:
             sa_info = st.secrets["gcp_service_account"]
-            creds = Credentials.from_service_account_info(sa_info, scopes=scopes)
-            return creds
+            return Credentials.from_service_account_info(sa_info, scopes=scopes)
     except Exception as e:
-        st.error("Error leyendo gcp_service_account desde st.secrets.")
-        st.exception(e)
-        return None
+        st.warning("gcp_service_account presente pero no válido: " + str(e))
 
-    # 3) GOOGLE_APPLICATION_CREDENTIALS (ruta)
+    # 3) GOOGLE_APPLICATION_CREDENTIALS
     try:
         gpath = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
         if gpath:
-            creds = Credentials.from_service_account_file(gpath, scopes=scopes)
-            return creds
+            return Credentials.from_service_account_file(gpath, scopes=scopes)
     except Exception as e:
-        st.error("Error cargando GOOGLE_APPLICATION_CREDENTIALS desde la ruta indicada.")
+        st.warning("Error cargando GOOGLE_APPLICATION_CREDENTIALS: " + str(e))
+
+    # 4) fallback local file (desarrollo)
+    local = find_credentials_file(CRED_FOLDER, CRED_PREFIX)
+    if local:
+        try:
+            return Credentials.from_service_account_file(str(local), scopes=scopes)
+        except Exception as e:
+            st.warning("Error leyendo fichero local de credenciales: " + str(e))
+
+    return None
+
+def connect_gsheets(creds, sheet_url):
+    if creds is None:
+        st.error("No se han encontrado credenciales para Google Sheets.")
+        return None
+    try:
+        client = gspread.authorize(creds)
+        sh = client.open_by_url(sheet_url)
+        return sh
+    except Exception as e:
+        st.error("Error autenticando/abriendo la Google Sheet con las credenciales proporcionadas.")
         st.exception(e)
         return None
-
-    # No se encontraron credenciales en secrets/env
-    return None
-
-def connect_gsheets_using_creds_or_file(sheet_url: str, cred_file_path: Path = None):
-    """
-    Intenta conectar usando:
-      1) credenciales obtenidas de st.secrets/env
-      2) si no hay, usar un fichero local (cred_file_path) vía Credentials.from_service_account_file
-    """
-    # Primero intentar st.secrets / env
-    creds = get_credentials_from_st_secrets_or_env(SCOPES)
-    if creds:
-        try:
-            client = gspread.authorize(creds)
-            sh = client.open_by_url(sheet_url)
-            return sh
-        except Exception as e:
-            st.error("Error autenticando con las credenciales de st.secrets / env.")
-            st.exception(e)
-            return None
-
-    # Si no hay creds en secrets/env, intentar fichero local (fallback para dev)
-    if cred_file_path:
-        try:
-            creds_file = Credentials.from_service_account_file(str(cred_file_path), scopes=SCOPES)
-            client = gspread.authorize(creds_file)
-            sh = client.open_by_url(sheet_url)
-            return sh
-        except Exception as e:
-            st.error("Error autenticando con el fichero local de credenciales (fallback).")
-            st.exception(e)
-            return None
-
-    # No hay forma de autenticar
-    st.error("No se encontraron credenciales en st.secrets ni en GOOGLE_APPLICATION_CREDENTIALS ni en el fichero local.")
-    return None
-
-@st.cache_data(ttl=30)
-def load_local_excel(path: Path):
-    if not path.exists():
-        return None, f"No se encontró el Excel en: {path}"
-    try:
-        df = pd.read_excel(path, engine="openpyxl")
-        df = df.rename(columns={col: col.strip() if isinstance(col, str) else col for col in df.columns})
-        for candidate in ['Fecha Partido','Fecha','FechaPartido','fecha_partido']:
-            if candidate in df.columns:
-                df['Fecha Partido'] = pd.to_datetime(df[candidate], errors='coerce')
-                break
-        return df, None
-    except Exception as e:
-        return None, f"Error leyendo Excel: {e}"
 
 def get_or_create_ratings_ws(sh, title=RATINGS_SHEET_NAME):
     try:
@@ -220,11 +165,13 @@ def get_or_create_ratings_ws(sh, title=RATINGS_SHEET_NAME):
         st.exception(e)
         return None
 
-# ------------------ Inicialización ------------------
-# Intentar conectar usando st.secrets (recomendado) y, si no, fallback a fichero local
-# Note: NO borramos tu lógica de usar EXCEL_PATH; solo cambiamos la autenticación.
-local_cred_file = find_credentials_file(CRED_FOLDER, CRED_PREFIX)
-sh = connect_gsheets_using_creds_or_file(SHEET_URL, cred_file_path=local_cred_file)
+# ------------------ Conexión usando st.secrets / fallback ------------------
+creds = get_credentials_from_st_secrets_or_env(SCOPES)
+if creds is None:
+    st.error("No se encontraron credenciales válidas. Añade `gcp_service_account` o `SERVICE_ACCOUNT_JSON` en Streamlit Secrets.")
+    st.stop()
+
+sh = connect_gsheets(creds, SHEET_URL)
 if sh is None:
     st.stop()
 
@@ -232,12 +179,33 @@ ratings_ws = get_or_create_ratings_ws(sh)
 if ratings_ws is None:
     st.stop()
 
-# Mantengo EXACTAMENTE la lógica original: cargar EXCEL local
-df, err = load_local_excel(EXCEL_PATH)
-if df is None:
-    st.error(err)
+# ------------------ Cargar alineaciones desde la worksheet "Alineaciones" ------------------
+try:
+    try:
+        ws_align = sh.worksheet(ALIGN_WORKSHEET_NAME)
+    except Exception:
+        # si no existe la worksheet con ese nombre, usar la primera hoja
+        ws_align = sh.sheet1
+
+    align_records = ws_align.get_all_records()
+    df = pd.DataFrame(align_records)
+    # normalizar columnas y Fecha Partido como en tu código original
+    df = df.rename(columns={col: col.strip() if isinstance(col, str) else col for col in df.columns})
+    for candidate in ['Fecha Partido','Fecha','FechaPartido','fecha_partido']:
+        if candidate in df.columns:
+            df['Fecha Partido'] = pd.to_datetime(df[candidate], errors='coerce')
+            break
+
+    if df is None or df.empty:
+        st.error(f"La hoja '{ALIGN_WORKSHEET_NAME}' está vacía o no tiene registros legibles.")
+        st.stop()
+
+except Exception as e:
+    st.error("Error cargando la hoja de alineaciones desde Google Sheets.")
+    st.exception(e)
     st.stop()
 
+# ------------------ Leer registros existentes desde la pestaña Calificaciones ------------------
 records = []
 try:
     records = ratings_ws.get_all_records()
@@ -251,45 +219,34 @@ if 'first_load' not in st.session_state:
     st.session_state['first_load'] = True
 if 'evaluador' not in st.session_state:
     st.session_state['evaluador'] = ""
-# flag temporal: cuando creas un evaluador lo guardamos aquí para que la siguiente rerun lo use en el selectbox
 if 'pending_new_eval' not in st.session_state:
     st.session_state['pending_new_eval'] = ""
 
-# ------------------ Sidebar: evaluador ------------------
+# ------------------ Sidebar: evaluador (misma lógica que tenías) ------------------
 existing_evaluadores = sorted({str(r.get('Evaluador','')).strip() for r in records if str(r.get('Evaluador','')).strip()})
 create_option = "— Crear nuevo evaluador —"
 placeholder_option = "— Selecciona evaluador —"
 
-# Si hay un pending_new_eval (viene de la ejecución anterior donde se pulsó Crear), inclúyelo en las opciones
 temp_extra = []
 if st.session_state.get('pending_new_eval'):
     pending = st.session_state['pending_new_eval'].strip()
     if pending and pending not in existing_evaluadores:
         temp_extra = [pending]
-    # lo consumimos aquí para que el selectbox lo vea en esta rerun
     st.session_state['pending_new_eval'] = ""
 
-# Default selection value (si es la primera carga, forzamos placeholder)
 default_value = placeholder_option if st.session_state.get('first_load', False) else (st.session_state.get('evaluador') or placeholder_option)
-
 eval_options = [placeholder_option] + existing_evaluadores + temp_extra + [create_option]
-
-# Determinar índice por defecto sin tocar st.session_state después
 default_index = 0
 if default_value in eval_options:
     default_index = eval_options.index(default_value)
 
-# Ahora instanciamos el selectbox UNA sola vez (no modificaremos su session_state key posteriormente)
 selected_eval = st.sidebar.selectbox("Elige tu evaluador", eval_options, index=default_index, key="eval_selectbox")
 
-# --- Lógica de creación/selección ---
-# Si placeholder -> inactivo
 if selected_eval == placeholder_option:
     st.sidebar.info("Por favor selecciona o crea un evaluador para habilitar la app.")
     st.warning("La app está inactiva hasta que selecciones o crees un evaluador en la barra lateral.")
     st.stop()
 
-# Si se eligió crear nuevo evaluador -> mostramos input + botón y permanecemos inactivos hasta confirmar
 if selected_eval == create_option:
     new_eval = st.sidebar.text_input("Nuevo nombre de evaluador", value="", key="new_eval_input")
     create_pressed = st.sidebar.button("Crear y usar este nombre", key="create_eval_btn")
@@ -297,21 +254,15 @@ if selected_eval == create_option:
     if not create_pressed:
         st.warning("La app está inactiva hasta que confirmes la creación del evaluador.")
         st.stop()
-    # Si pulsó crear: validar
     if create_pressed:
         if new_eval.strip() == "":
             st.sidebar.error("El nombre no puede estar vacío.")
             st.stop()
-        # Guardamos evaluador en session_state y marcamos pending para que la siguiente rerun lo use en el selectbox
         st.session_state['evaluador'] = new_eval.strip()
         st.session_state['pending_new_eval'] = new_eval.strip()
         st.session_state['first_load'] = False
         st.sidebar.success(f"Creado evaluador: {st.session_state['evaluador']}")
-        # Nota: no tocamos st.session_state['eval_selectbox'] aquí (evitamos StreamlitAPIException).
-        # La interacción del botón causa un rerun; en la siguiente ejecución `pending_new_eval` se consumirá
-        # y la nueva opción aparecerá en el selectbox (y quedará seleccionada por default).
 
-# Si se seleccionó un evaluador existente
 if selected_eval != create_option and selected_eval != placeholder_option:
     st.session_state['evaluador'] = selected_eval
     st.session_state['first_load'] = False
@@ -321,16 +272,14 @@ if not evaluador:
     st.warning("Evaluador no establecido. Selecciona o crea un evaluador en la barra lateral.")
     st.stop()
 
-# ------------------ NUEVO: badge persistente mostrando el evaluador activo ------------------
-# Esto aparece siempre en la sidebar mientras haya un evaluador en session_state
+# Badge persistente
 st.sidebar.markdown("---")
-st.sidebar.markdown(f"**Evaluando:**  \n`{evaluador}`")  # salto de línea para mejor aspecto
-st.sidebar.markdown("")  # espacio extra opcional
+st.sidebar.markdown(f"**Evaluando:**  \n`{evaluador}`")
+st.sidebar.markdown("")
 
-# ------------------ Selección de jornada y resto de UI (igual que antes) ------------------
-# Validar columna Jornada
+# ------------------ Selección de jornada y resto de UI (igual que tu código original) ------------------
 if 'Jornada' not in df.columns:
-    st.error('La columna "Jornada" no está presente en el Excel. Actualiza el Excel.')
+    st.error('La columna "Jornada" no está presente en la hoja de alineaciones. Actualiza la sheet.')
     st.stop()
 
 try:
@@ -350,7 +299,7 @@ try:
                     m = pattern_score.match(rp)
                     if m:
                         t1 = m.group(1).strip()
-                        res = m.group(2).strip().replace('–', '-')
+                        res = m.group(2).strip().replace('\u2013', '-')
                         t2 = m.group(3).strip()
                         if t1 and t2:
                             found_team_values = [t1, t2]
@@ -359,7 +308,7 @@ try:
                         score_pat = re.compile(r'(\d+\s*[-–]\s*\d+)')
                         m2 = score_pat.search(rp)
                         if m2:
-                            resultado_partido = m2.group(1).replace('–', '-').strip()
+                            resultado_partido = m2.group(1).replace('\u2013', '-').strip()
 
         if not found_team_values:
             for col in subset.columns:
@@ -390,7 +339,7 @@ try:
                     m_sc = pattern_score.search(cell_str)
                     if m_sc:
                         t1 = m_sc.group(1).strip()
-                        res = m_sc.group(2).strip().replace('–', '-')
+                        res = m_sc.group(2).strip().replace('\u2013', '-')
                         t2 = m_sc.group(3).strip()
                         if t1 and t2:
                             found_team_values = [t1, t2]
@@ -407,7 +356,7 @@ try:
                     s = cell.strip()
                     m = score_pat.search(s)
                     if m:
-                        resultado_partido = m.group(1).replace('–', '-').strip()
+                        resultado_partido = m.group(1).replace('\u2013', '-').strip()
                         break
                 if resultado_partido:
                     break
@@ -473,7 +422,7 @@ for idx, rec in enumerate(records):
     key = (str(rec.get('Jornada')), str(rec.get('Jugador')), str(rec.get('Evaluador', '')))
     existing_map[key] = (rec, idx)
 
-# Mostrar alineación y minutos
+# Mostrar alineación y minutos (idéntico a tu código original)
 col1, col2, col3 = st.columns([1,2,2])
 with col1:
     try:
@@ -542,8 +491,7 @@ with col3:
 
 st.markdown("---")
 
-# ------------------ NUEVO: Promedio de calificaciones YA GUARDADAS por este evaluador en esta jornada
-# Calculamos únicamente con registros ya guardados en Google Sheets, filtrando por jornada y evaluador.
+# ------------------ Promedio de calificaciones YA GUARDADAS por este evaluador en esta jornada
 calificaciones_guardadas = []
 for rec in records:
     try:
@@ -556,7 +504,6 @@ for rec in records:
 
 if calificaciones_guardadas:
     avg_val = sum(calificaciones_guardadas) / len(calificaciones_guardadas)
-    # Mostrar justo encima del formulario de calificaciones
     st.markdown("### Promedio (esta jornada — tus calificaciones guardadas)")
     st.metric("Promedio", f"{avg_val:.2f}", delta=f"{len(calificaciones_guardadas)} entradas")
 else:
@@ -602,11 +549,8 @@ with st.form("ratings_form_optimized"):
         a_col, b_col, c_col = st.columns([6,2,1])
         with a_col:
             min_display = minutos if minutos not in (None, '') else '—'
-            if gol >= 1 or asistencia >= 1:
-                block = f"{jugador}  \n_min: {min_display}_  \nGol: {gol}  •  Ast: {asistencia}"
-                st.markdown(f"**{block}**")
-            else:
-                st.markdown(f"**{jugador}**  \n_min: {min_display}_  \nGol: {gol}  •  Ast: {asistencia}")
+            block = f"{jugador}  \n_min: {min_display}_  \nGol: {gol}  •  Ast: {asistencia}"
+            st.markdown(f"**{block}**")
 
         with b_col:
             cal_key = f"cal_{selected_jornada}_{orig_idx}_{evaluador}"
@@ -630,7 +574,7 @@ with st.form("ratings_form_optimized"):
 
     submitted = st.form_submit_button("Guardar calificaciones")
 
-# Guardado en Google Sheets
+# Guardado en Google Sheets (idéntico a tu lógica original)
 if submitted:
     try:
         records = ratings_ws.get_all_records()
