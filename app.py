@@ -440,7 +440,7 @@ st.session_state.setdefault("pending_new_eval", "")
 st.session_state.setdefault("submitted_jornada", None)
 st.session_state.setdefault("saving_in_progress", False)  # evita envíos concurrentes
 st.session_state.setdefault("created_now", False)  # marca que acabamos de crear un evaluador
-st.session_state.setdefault("eval_selectbox", st.session_state.get("evaluador", ""))  # persistencia del selectbox
+# NOTA: No hacemos setdefault de "eval_selectbox" aquí para evitar conflicto con el widget
 
 # Sidebar: evaluador list / create UI (selector en sidebar)
 existing_evaluadores = sorted({str(r).strip() for r in ratings_df["Evaluador"].dropna().unique()}) if not ratings_df.empty else []
@@ -460,70 +460,40 @@ current_eval = st.session_state.get("evaluador", "")
 if current_eval and current_eval not in existing_evaluadores and current_eval not in temp_extra:
     temp_extra.append(current_eval)
 
-# Respectamos un posible valor previamente forzado del selectbox (eval_selectbox)
-default_value = st.session_state.get("eval_selectbox", None)
-if default_value is None:
-    default_value = placeholder_option if st.session_state.get("first_load", False) else (st.session_state.get("evaluador") or placeholder_option)
-
+# Construcción de opciones
 eval_options = [placeholder_option] + existing_evaluadores + temp_extra + [create_option]
+
+# ---- NUEVA LÓGICA ROBUSTA para evitar warning de Streamlit ----
+# Si hay un valor guardado en session_state para eval_selectbox pero ya no está
+# entre las opciones (p. ej. cambió la lista), lo eliminamos para forzar inicialización limpia.
+if "eval_selectbox" in st.session_state:
+    current_val = st.session_state.get("eval_selectbox")
+    if current_val not in eval_options:
+        st.session_state.pop("eval_selectbox", None)
+
+# Default value usado para index si no hay valor en session_state
+default_value = None
+# Preferir eval_selectbox guardado si existe, si no usar evaluador si existe, si no None
+if "eval_selectbox" in st.session_state:
+    default_value = st.session_state.get("eval_selectbox")
+else:
+    default_value = st.session_state.get("evaluador") or placeholder_option
+
+# Ahora calculamos el índice por defecto si necesitamos pasar index (solo si la key NO existe)
 default_index = 0
 if default_value in eval_options:
     default_index = eval_options.index(default_value)
 else:
-    # si el default_value no está (p.ej. valor nuevo), añadimos y usamos ese índice
+    # si el valor por defecto no está entre opciones (ej. nuevo nombre), lo insertamos en la posición 1
     eval_options.insert(1, default_value)
     default_index = 1
 
-# --------------------------
-# Aquí inyectamos CSS dinámico según el contenido de eval_options
-# --------------------------
-max_label_len = 0
-try:
-    max_label_len = max(len(str(o)) for o in eval_options) if eval_options else 30
-except Exception:
-    max_label_len = 30
-
-CHAR_WIDTH_PX = 8
-HORIZONTAL_PADDING_PX = 120  # espacio adicional para padding / iconos / scrollbar
-MIN_SIDEBAR_PX = 300
-MAX_SIDEBAR_PX = 900
-
-computed_width = max(MIN_SIDEBAR_PX, min(MAX_SIDEBAR_PX, max_label_len * CHAR_WIDTH_PX + HORIZONTAL_PADDING_PX))
-listbox_min_width = max(280, computed_width - 40)
-
-st.markdown(
-    f"""
-    <style>
-    /* Target common sidebar container */
-    [data-testid="stSidebar"] > div:first-child {{
-        min-width: {computed_width}px;
-        width: {computed_width}px;
-    }}
-    /* Fallback selectors used por algunas Streamlit builds */
-    .css-1d391kg, .css-1v3fvcr, .css-1lsmgbg {{
-        min-width: {computed_width}px !important;
-        width: {computed_width}px !important;
-    }}
-    /* Expand the listbox (dropdown options panel) */
-    div[role="listbox"] {{
-        min-width: {listbox_min_width}px !important;
-        width: {listbox_min_width}px !important;
-    }}
-    /* Allow selectbox label / content to wrap instead of truncating */
-    .stSelectbox div[role="button"], .stSelectbox .css-1tq9d2s {{
-        white-space: normal !important;
-    }}
-    /* Ensure sidebar widgets don't overflow horizontally */
-    [data-testid="stSidebar"] .stSelectbox, [data-testid="stSidebar"] .stTextInput {{
-        width: 100% !important;
-    }}
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-# -- Selector en la barra lateral (debería caber por defecto ahora) --
-selected_eval = st.sidebar.selectbox("Elige tu evaluador", eval_options, index=default_index, key="eval_selectbox")
+# Crear el selectbox: si ya existía "eval_selectbox" en session_state dejamos que el widget
+# use ese valor (no pasamos index); si no existía, pasamos index para controlar inicialización.
+if "eval_selectbox" in st.session_state:
+    selected_eval = st.sidebar.selectbox("Elige tu evaluador", eval_options, key="eval_selectbox")
+else:
+    selected_eval = st.sidebar.selectbox("Elige tu evaluador", eval_options, index=default_index, key="eval_selectbox")
 
 # Si acabamos de crear el evaluador (created_now True) permitimos continuar en vez de st.stop()
 if selected_eval == placeholder_option and not st.session_state.get("created_now", False):
@@ -1046,4 +1016,3 @@ else:
     )
 
 # Fin del archivo
-
